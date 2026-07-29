@@ -5,6 +5,7 @@
 | 文件 | 说明 |
 |------|------|
 | [`setup-connect-ai-agent-logs.sh`](./setup-connect-ai-agent-logs.sh) | 一键配置脚本，幂等可重复执行 |
+| [`setup-connect-ai-agent-logs-check.sh`](./setup-connect-ai-agent-logs-check.sh) | 只读体检脚本，排查"日志组建好了却没有日志"的问题（见下方章节）|
 | [`setup-connect-ai-agent-logs-analysis.sh`](./setup-connect-ai-agent-logs-analysis.sh) | 拉取两路日志、按 Contact ID 关联并本地可视化排查（见文末章节）|
 | [`setup-connect-ai-agent-logs-analysis-in-cloudfront.sh`](./setup-connect-ai-agent-logs-analysis-in-cloudfront.sh) | 同上，但把排查页面部署到 CloudFront，并用 Cognito 登录鉴权（见文末章节）|
 | [`load-cloudwatch-logs.sh`](./load-cloudwatch-logs.sh) | 按日志组 ARN 下载全部日志并打包 zip（见文末章节）|
@@ -167,6 +168,61 @@ filter session_name = "<SessionName>"
 
 - **能否投递到 S3 / Firehose？**
   可以。修改脚本第 5 步的 `destinationResourceArn` 为对应的 S3 桶或 Firehose 流 ARN，并配置相应的资源策略。
+
+---
+
+# 投递链体检（setup-connect-ai-agent-logs-check.sh）
+
+配好之后最常见的困惑是：**日志组 `/aws/connect/ai-agent-logs` 建出来了，但拨打电话 / test chat 跟 AI agent 交互后，里面一直没有任何日志。** 这个脚本对整条投递链做一次**只读**体检，把问题定位到具体环节。
+
+整条链路是 **投递源(assistant) → 投递目标(日志组) → 投递关系**，只要其中任意一环和你实际触发的 AI agent 对不上，日志组就会一直为空。脚本只读，不创建/修改任何资源，可安全反复运行。
+
+## 用法
+
+```bash
+chmod +x setup-connect-ai-agent-logs-check.sh
+
+# 唯一参数与 setup 脚本一致：Connect 实例 ARN(不传则交互式提示输入)
+./setup-connect-ai-agent-logs-check.sh <amazon-connect-instance-arn>
+```
+
+示例：
+
+```bash
+./setup-connect-ai-agent-logs-check.sh \
+  arn:aws:connect:us-west-2:991727053196:instance/abcd1234-5678-90ab-cdef-1234567890ab
+```
+
+## 检查项
+
+脚本按 7 步逐项检查，每项给出 `[OK] / [WARN] / [FAIL]`：
+
+| 步骤 | 检查内容 | 目的 |
+|------|----------|------|
+| 1 | 解析实例 ARN | 得到 region / account-id / instance-id |
+| 2 | `WISDOM_ASSISTANT` 集成关联 | 确认 AI agent 已启用；统计 assistant 数量（多个会告警，因为 setup 只用第一个）|
+| 3 | 投递源 Delivery Source | 是否指向该 assistant、`logType` 是否为 `EVENT_LOGS`；找不到时列出该 region 现有投递源，便于看是否指向了别的 ARN |
+| 4 | 日志组 Log Group | `/aws/connect/ai-agent-logs` 是否存在 |
+| 5 | 投递目标 Delivery Destination | 是否指向该日志组 |
+| 6 | 投递关系 Delivery | 投递源与投递目标是否已 `CreateDelivery` 关联 |
+| 7 | 日志组是否已产生日志 | 有无日志流 / 最近 24 小时是否有新事件 |
+
+最后打印"通过 / 警告 / 失败"汇总、按情况给出**后续建议**，并附上实时观察命令：
+
+```bash
+aws logs tail "/aws/connect/ai-agent-logs" --region <your-region> --follow
+```
+
+> 退出码：全部通过或仅有警告返回 `0`；存在 `[FAIL]` 环节时返回 `2`，方便在 CI / 脚本里判断。
+
+## 如何看结论
+
+- **有 `[FAIL]`**：投递链本身没搭好（缺投递源/目标/关系，或指向了错误资源），日志不可能进来 —— 通常重跑 `setup-connect-ai-agent-logs.sh` 即可。
+- **2–6 全 `[OK]`，但第 7 步为空**：投递链没问题，日志为空多半是**使用姿势**问题：
+  - 交互没有真正进入**自助式(self-service) AI agent** —— 只有它直接与客户对话时才产生 EVENT_LOGS；agent-assist（给人工坐席推荐）、普通播放提示 / Lex 机器人都不会产生这套日志；
+  - 会话发生在**建链之前** —— 历史交互不会补投，需在建链后发起**全新**会话；
+  - **首条投递有几分钟延迟** —— 发起新会话后稍等 3~5 分钟再看。
+- **第 2 步告警（多个 assistant）**：确认 setup 脚本用的第一个 assistant，就是你 AI agent 实际绑定的那个，否则日志会投到别的源。
 
 ---
 
