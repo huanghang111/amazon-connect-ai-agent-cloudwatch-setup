@@ -255,6 +255,14 @@
   .dashboard { flex: 1; overflow-y: auto; padding: 20px 24px; display: none; }
   .dashboard.show { display: block; }
   .dash-section-title { font-size: 14px; font-weight: 600; margin: 4px 0 12px; color: var(--text); }
+  .dash-list-head { display: flex; align-items: center; gap: 12px; margin: 4px 0 12px; }
+  .dash-list-head .dash-section-title { margin: 0; }
+  .refresh-btn {
+    font-size: 12px; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--text); transition: all 0.12s;
+  }
+  .refresh-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .refresh-btn:disabled { opacity: .6; cursor: default; }
 
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 14px; margin-bottom: 24px; }
   .card {
@@ -370,7 +378,10 @@
 
 <!-- Dashboard 视图 -->
 <div class="dashboard show" id="viewDashboard">
-  <div class="dash-section-title" data-i18n="dashContactList">Contact 列表</div>
+  <div class="dash-list-head">
+    <div class="dash-section-title" data-i18n="dashContactList">Contact 列表</div>
+    <button class="refresh-btn" id="btnRefreshSummary" data-i18n="btnRefreshSummary">刷新通话摘要</button>
+  </div>
   <div class="table-scroll">
     <table class="contact-table">
       <thead>
@@ -386,12 +397,11 @@
           <th data-i18n="thSysException">System Exception</th>
           <th data-i18n="thFaqAsk">FAQ 提出次数</th>
           <th data-i18n="thFaqSend">FAQ 发送次数</th>
-          <th data-i18n="thFaqResolve">FAQ 解决次数</th>
-          <th data-i18n="thFaqRate">FAQ 解决率</th>
           <th data-i18n="thDisconnect">挂断方</th>
           <th data-i18n="thSrIntent">创建 SR 意图触发次数</th>
           <th data-i18n="thSrSuccess">SR Draft 创建成功次数</th>
           <th data-i18n="thSrRate">SR Draft 创建成功率</th>
+          <th data-i18n="thSrNumber">SR工单号</th>
           <th data-i18n="thSrRounds">SR 信息提取回答轮次</th>
           <th data-i18n="thLatency">响应延迟</th>
           <th data-i18n="thIntentAcc">意图识别准确率</th>
