@@ -317,8 +317,10 @@
   .contact-table tr:last-child td { border-bottom: none; }
   .contact-table tr:hover td { background: var(--panel-2); }
   .contact-table .cid-cell { font-family: ui-monospace, monospace; color: var(--accent); word-break: break-all; }
-  .contact-table .cid-cell.clickable { cursor: pointer; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; }
-  .contact-table .cid-cell.clickable:hover { color: #7fb8ff; }
+  .contact-table .cid-cell .cid-value { display: inline; }
+  .contact-table .cid-cell .cid-value.clickable { cursor: pointer; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; }
+  .contact-table .cid-cell .cid-value.clickable:hover { color: #7fb8ff; }
+  .contact-table .cid-cell .js-copy-cid { margin-left: 6px; vertical-align: middle; }
 
   /* ---- Contact 详情视图 (DescribeContact) ---- */
   .contact-detail { flex: 1; overflow-y: auto; padding: 16px 24px; display: none; }
