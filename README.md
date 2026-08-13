@@ -9,6 +9,7 @@
 | [`setup-connect-ai-agent-logs-analysis.sh`](./setup-connect-ai-agent-logs-analysis.sh) | 拉取两路日志、按 Contact ID 关联并本地可视化排查（见文末章节）|
 | [`setup-connect-ai-agent-logs-analysis-in-cloudfront.sh`](./setup-connect-ai-agent-logs-analysis-in-cloudfront.sh) | 同上，但把排查页面部署到 CloudFront，并用 Cognito 登录鉴权（见文末章节）|
 | [`load-cloudwatch-logs.sh`](./load-cloudwatch-logs.sh) | 按日志组 ARN 下载全部日志并打包 zip（见文末章节）|
+| [`agentcore-evaluation/`](./agentcore-evaluation) | 日志投递配好之后的**自动评估流水线**：定时拉取日志 → 转成 OTEL 格式写入 AgentCore Observability → 自动调用 AgentCore Evaluation / Insights / Recommendation → 结果与图表落到 S3（见该目录 README）|
 
 > 配置原理参考官方文档：[Monitor Connect AI agents by using CloudWatch Logs](https://docs.aws.amazon.com/connect/latest/adminguide/monitor-ai-agents.html)
 
