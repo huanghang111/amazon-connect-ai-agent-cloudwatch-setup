@@ -8,6 +8,7 @@
 | [`setup-connect-ai-agent-logs-check.sh`](./setup-connect-ai-agent-logs-check.sh) | 只读体检脚本，排查"日志组建好了却没有日志"的问题（见下方章节）|
 | [`setup-connect-ai-agent-logs-analysis.sh`](./setup-connect-ai-agent-logs-analysis.sh) | 拉取两路日志、按 Contact ID 关联并本地可视化排查（见文末章节）|
 | [`setup-connect-ai-agent-logs-analysis-in-cloudfront.sh`](./setup-connect-ai-agent-logs-analysis-in-cloudfront.sh) | 同上，但把排查页面部署到 CloudFront，并用 Cognito 登录鉴权（见文末章节）|
+| [`setup-connect-ai-agent-logs-analysis-in-cloudfront-scheduled.sh`](./setup-connect-ai-agent-logs-analysis-in-cloudfront-scheduled.sh) | 在 CloudFront 版之上增加**定时按天采集**（每天定时处理昨天 UTC 整天日志），页面顶部新增**日期控件**按天查看 Contact 列表（见文末章节）|
 | [`load-cloudwatch-logs.sh`](./load-cloudwatch-logs.sh) | 按日志组 ARN 下载全部日志并打包 zip（见文末章节）|
 | [`agentcore-evaluation/`](./agentcore-evaluation) | 日志投递配好之后的**自动评估流水线**：定时拉取日志 → 转成 OTEL 格式写入 AgentCore Observability → 自动调用 AgentCore Evaluation / Insights / Recommendation → 结果与图表落到 S3（见该目录 README）|
 
@@ -552,3 +553,216 @@ chmod +x setup-connect-ai-agent-logs-analysis-in-cloudfront.sh
 - **页面空白 / 没有 Contact？** 说明所选时间范围内日志为空，去掉 `--hours` 拉取全部历史，或核对日志组 ARN 与权限。
 - **页面提示加载日志失败？** 多为身份池角色权限或桶 CORS 问题；脚本已自动为鉴权角色授予该桶只读权限并配置 CORS，重跑脚本即可修复。
 - **翻译按钮为何不见了？** CloudFront 是纯静态托管，没有本地 `serve.py` 的按需翻译接口，因此翻译功能自动隐藏（本地预览版仍可用）。
+
+---
+
+# 定时按天采集 + 日期控件（setup-connect-ai-agent-logs-analysis-in-cloudfront-scheduled.sh）
+
+CloudFront 版（`setup-connect-ai-agent-logs-analysis-in-cloudfront.sh`）是**一次性**部署：本地把日志拉一遍、拆分上传、发布页面。数据不会自动更新，页面也只展示"这一次拉到的全部数据"。
+
+本脚本在其**全部能力之上**（S3 日志桶 + 云端拆分 Lambda + Cognito 登录 + CloudFront 站点），新增两件事：
+
+1. **定时按天采集**：部署一个由 **Amazon EventBridge** 定时触发（默认每天 **01:00 UTC**）的**采集 Lambda**，每次处理**昨天（UTC）一整天** `[00:00, 次日 00:00)` 的日志，按日期分区归档到 S3 并触发云端拆分。
+2. **页面日期控件**：站点顶部新增「日期」下拉框，选择某一天即加载并展示**当天的 Contact 列表**与会话时间线。
+
+全程不在本地处理任何日志文件（采集、拆分均在云端）。
+
+| 文件 | 说明 |
+|------|------|
+| [`setup-connect-ai-agent-logs-analysis-in-cloudfront-scheduled.sh`](./setup-connect-ai-agent-logs-analysis-in-cloudfront-scheduled.sh) | 部署日志桶+拆分 Lambda+**采集 Lambda**+**EventBridge 定时规则**+Cognito+CloudFront，并可回补最近若干天 |
+| [`lib/lambda/collector.py`](./lib/lambda/collector.py) | **采集 Lambda**：定时（或手动带 `date`）拉取某个 UTC 日的 CloudWatch 日志，流式（multipart）归档到 `daily/<date>/raw/`，再写触发对象触发拆分 |
+| [`lib/lambda/handler.py`](./lib/lambda/handler.py) | 复用 CloudFront 版的**拆分 Lambda**：按 `trigger/*.json` 里的 `prefix` 把该天日志拆到 `daily/<date>/index.json` + `logs/*.log` |
+| [`lib/web-cloudfront/auth-scheduled.js`](./lib/web-cloudfront/auth-scheduled.js) | 在 `auth.js` 基础上新增：登录后列出可选日期、注入「日期」控件、按天加载数据；切换日期时复用会话免重登 |
+
+## 数据按日期分区
+
+所有数据都落在**按 UTC 日期分区**的前缀下，各天互不干扰：
+
+```
+s3://ai-agent-logs<suffix>/
+├─ daily/
+│  ├─ 2026-08-12/
+│  │  ├─ raw/connect.ndjson        原始日志(长期保存)
+│  │  ├─ raw/gateway.ndjson        (若配置了 Gateway)
+│  │  ├─ logs/<contactId>.log      按 Contact 拆分
+│  │  └─ index.json                当天清单(供前端加载)
+│  └─ 2026-08-13/
+│     └─ ...
+└─ trigger/
+   └─ daily-2026-08-13.json        采集写入 → 触发拆分 Lambda
+```
+
+## 整体架构与流程图
+
+### 采集与拆分（云端定时）
+
+```mermaid
+flowchart TD
+    EB["Amazon EventBridge 定时规则<br/>(默认 cron(0 1 * * ? *) = 每天 01:00 UTC)"]
+    EB -->|"触发(无 payload) → 处理昨天 UTC"| COL["采集 Lambda (collector.py)"]
+    COL -->|"filter-log-events 分页拉取<br/>昨天 [00:00, 次日00:00) UTC"| CW["CloudWatch Logs<br/>(Connect / 可选 Gateway 日志组)"]
+    COL -->|"NDJSON 流式 multipart 上传"| RAW["S3: daily/&lt;date&gt;/raw/*.ndjson"]
+    COL -->|"写触发对象"| TRG["S3: trigger/daily-&lt;date&gt;.json"]
+    TRG -->|"S3 事件通知(prefix=trigger/, suffix=.json)"| SPL["拆分 Lambda (handler.py)"]
+    SPL -->|"按 Contact ID 拆分, prefix=daily/&lt;date&gt;/"| OUT["S3: daily/&lt;date&gt;/index.json<br/>+ logs/&lt;contactId&gt;.log"]
+```
+
+纯文本等价流程（无法渲染 Mermaid 时参考）：
+
+```
+EventBridge 定时规则(每天 01:00 UTC, 可改)
+    │  触发(无 payload) → 采集 Lambda 默认处理"昨天(UTC)"
+    ▼
+采集 Lambda (collector.py)
+    │  ① 计算昨天 UTC 起止毫秒 [00:00, 次日00:00)
+    │  ② filter-log-events 分页拉取该窗口全部事件
+    │  ③ NDJSON 流式 multipart 上传 → daily/<date>/raw/{connect,gateway}.ndjson
+    │  ④ 写 trigger/daily-<date>.json (含 prefix=daily/<date>/)
+    ▼
+S3 事件通知(trigger/ 前缀 + .json 后缀)
+    ▼
+拆分 Lambda (handler.py)   ← 与一次性 CloudFront 版完全相同
+    │  读 raw/ → 按 Contact ID 拆分(prefix=daily/<date>/)
+    ▼
+daily/<date>/index.json + logs/<contactId>.log
+```
+
+### 页面按天查看（浏览器）
+
+```mermaid
+flowchart TD
+    U["用户浏览器"] -->|"HTTPS"| CF["CloudFront (OAC) → 私有 Web 桶"]
+    CF --> AUTH["auth-scheduled.js"]
+    AUTH -->|"Cognito 登录 / 首次改密 / 忘记密码"| COG["Cognito 用户池 + 身份池<br/>(换临时 AWS 凭证)"]
+    AUTH -->|"① 列出 daily/ 下已有日期<br/>(listObjectsV2, Delimiter=/)"| S3D["S3 日志桶"]
+    AUTH -->|"② 顶部注入「日期」下拉框<br/>默认选最新一天"| DP["日期控件"]
+    DP -->|"选择某一天 → 存 sessionStorage → 整页刷新(复用会话免重登)"| AUTH
+    AUTH -->|"③ 读 daily/&lt;date&gt;/index.json + logs/*.log"| S3D
+    AUTH -->|"④ 组装数据 → 启动 app.js"| APP["app.js 渲染当天 Contact 列表/时间线"]
+```
+
+纯文本等价流程：
+
+```
+浏览器 ── CloudFront(OAC) ── 私有 Web 桶 ── auth-scheduled.js
+    │
+    ├─ Cognito 登录 → 身份池换取只读日志桶的临时凭证
+    │
+    ├─ ① 列出 daily/ 下已有日期(listObjectsV2 + Delimiter="/")
+    ├─ ② 顶部注入「日期」下拉框, 默认选最新一天
+    │        切换日期 → 存 sessionStorage → 整页刷新(会话保持, 免重登)
+    ├─ ③ 读取所选 daily/<date>/index.json 与其 logs/*.log
+    └─ ④ 组装 window.__CONNECT_AI_LOG_DATA__ → 动态加载 app.js 渲染当天数据
+```
+
+> **会话保持**：切换日期采用"整页刷新"以完整复用现有 `app.js` 的渲染逻辑。为避免每次切换都要重新登录，登录成功后会把 Cognito 的 `idToken`（含过期时间）与所选日期暂存到浏览器 `sessionStorage`；刷新后自动静默复用，`idToken` 过期或关闭标签页后失效，需要重新登录。
+
+## 用法
+
+```bash
+chmod +x setup-connect-ai-agent-logs-analysis-in-cloudfront-scheduled.sh
+
+# 交互式(未提供的必选项会逐个询问)
+./setup-connect-ai-agent-logs-analysis-in-cloudfront-scheduled.sh
+
+# 或直接用参数
+./setup-connect-ai-agent-logs-analysis-in-cloudfront-scheduled.sh \
+  --connect-arn "arn:aws:logs:us-west-2:111122223333:log-group:/aws/connect/ai-agent-logs:*" \
+  --gateway-arn "arn:aws:logs:us-west-2:111122223333:log-group:/aws/vendedlogs/bedrock-agentcore/gateway/APPLICATION_LOGS/<gw>:*" \
+  --connect-instance-arn "arn:aws:connect:us-west-2:111122223333:instance/abcd1234-5678-90ab-cdef-1234567890ab" \
+  --email you@example.com \
+  --suffix -demo \
+  --schedule-cron "cron(0 1 * * ? *)" \
+  --backfill-days 1
+```
+
+### 参数
+
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `--connect-arn <arn>` | Connect AI Agent 日志组 ARN | 必选（未提供则交互式询问）|
+| `--gateway-arn <arn>` | Bedrock AgentCore Gateway 日志组 ARN | 可选 |
+| `--connect-instance-arn <arn>` | Amazon Connect 实例 ARN（供浏览器调 `DescribeContact` 等）| 必选 |
+| `--email <addr>` | 登录用户邮箱（接收一次性密码）| 必选 |
+| `--suffix <s>` | 桶名后缀，日志桶为 `ai-agent-logs<suffix>` | 必选（仅小写字母/数字/连字符）|
+| `--region <r>` | 部署区域 | 取自 `--connect-arn` |
+| `--schedule-cron <expr>` | EventBridge 定时表达式（**UTC**）| `cron(0 1 * * ? *)`（每天 01:00 UTC = 北京 09:00）|
+| `--backfill-days <n>` | 部署后立即回补最近 n 天（不含今天）；`0` 表示不回补 | `1`（仅昨天）|
+| `--profile <p>` | AWS CLI profile | 默认凭证 |
+| `--lambda-memory <MB>` | 拆分/采集 Lambda 内存 | `3008` |
+| `--csat-attr <key>` | CSAT 满意度评分对应的联系人属性键名 | `botevaluation` |
+| `--out-dir <dir>` / `--keep` | 临时部署产物目录 / 保留该目录 | 系统临时目录 / 结束清理 |
+
+> **关于定时时间（UTC）**：`--schedule-cron` 的 cron 是 **UTC**。默认 `cron(0 1 * * ? *)` 为每天 01:00 UTC（= 北京时间每天 09:00）。若想按 **UTC 每天 9 点**运行，用 `cron(0 9 * * ? *)`。cron 六字段含义为 `分 时 日 月 星期 年`（AWS 要求"日"与"星期"其一为 `?`）。
+
+## 定时的时区与"处理哪一天"
+
+- **调度时间**由 `--schedule-cron`（UTC）决定，只影响"每天几点跑"。
+- **处理的数据范围**固定为**触发当天的前一天（UTC）整天** `[00:00, 次日 00:00)`——与调度时间无关。因此把定时设在每天凌晨/早上（默认 01:00 UTC）能确保昨天的数据已经齐全。
+- 若某次运行漏跑或想补看历史某天，可**手动补采**（见下）。
+
+## 暂停 / 恢复定时（以及在控制台哪里找这条规则）
+
+定时的本质是一条名为 `connect-ai-logs<suffix>-daily` 的 **EventBridge 规则**（建在 **default 事件总线**上、用 `aws events` API 管理的经典 Rule）。想停掉每天自动采集，禁用这条规则即可，页面/历史数据/Lambda 都保留、随时可恢复：
+
+```bash
+# 暂停(禁用)
+aws events disable-rule --name connect-ai-logs<suffix>-daily --region <region>
+
+# 恢复(启用)
+aws events enable-rule  --name connect-ai-logs<suffix>-daily --region <region>
+
+# 查看当前状态 / 定时表达式
+aws events describe-rule --name connect-ai-logs<suffix>-daily --region <region> \
+  --query '{Name:Name,State:State,Schedule:ScheduleExpression}' --output table
+```
+
+> **⚠️ 控制台里在哪找这条规则（免得再找）**
+> - 先把控制台右上角**区域切到部署区域**（`--region`，或取自 `--connect-arn`；资源清单文件里的 `REGION|...` 行也能查到）。
+> - 打开 **Amazon EventBridge** 后，这条规则会出现在 **Scheduler → Scheduled rules** 列表里（新版控制台把"带 schedule 的经典规则"归到这里展示）；也可在 **Buses → Rules**（Event bus 选 `default`）下找到——**两处指向同一条规则**。
+> - 注意别和左侧单独的 **EventBridge Scheduler（Schedules）** 搞混：那是另一套服务，本部署**没有**用它；本规则始终用 `aws events ...` 命令或上述页面管理。
+> - 选中规则后点 **Disable / Enable** 即可暂停 / 恢复。
+
+## 手动补采某一天
+
+采集 Lambda 支持带 `date` 手动触发（不必等定时）：
+
+```bash
+aws lambda invoke \
+  --function-name connect-ai-logs<suffix>-collector \
+  --region <region> \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{"date":"2026-08-10"}' \
+  /tmp/out.json && cat /tmp/out.json
+```
+
+采集完成后会自动触发拆分 Lambda 生成 `daily/2026-08-10/index.json`；刷新页面即可在「日期」控件里看到该天。
+
+## 与一次性 CloudFront 版的区别
+
+| 维度 | 一次性版（`...-in-cloudfront.sh`）| 定时按天版（本脚本）|
+|------|------|------|
+| 数据来源 | 本地 `fetch-to-s3.py` 拉取一次 | 云端**采集 Lambda** 定时拉取 |
+| 拉取范围 | `--hours`（0=全部历史）| 每次**昨天 UTC 整天**（可回补/手动补采）|
+| S3 布局 | 根前缀 `index.json` + `logs/` | 按天分区 `daily/<date>/index.json` + `logs/` |
+| 数据更新 | 需重跑脚本 | **每天自动**更新 |
+| 页面 | 展示这一次的全部数据 | 顶部**日期控件**按天切换 |
+| 额外资源 | — | **采集 Lambda**、**EventBridge 定时规则**、采集角色 |
+
+## 清理
+
+脚本会生成资源清单 `aws-resources-<suffix>-scheduled-<时间戳>.manifest`，其中**已包含**采集 Lambda、采集角色与 EventBridge 定时规则。用 `clear.sh` 按清单一键删除（`clear.sh` 已支持删除 EventBridge 规则：会先移除其 target 再删规则）：
+
+```bash
+./clear.sh "aws-resources-<suffix>-scheduled-<时间戳>.manifest"
+# 想保留 S3 里已归档的历史日志:
+./clear.sh "aws-resources-<suffix>-scheduled-<时间戳>.manifest" --keep-buckets
+```
+
+## 常见问题
+
+- **页面提示"暂无按天归档的数据"？** 说明 `daily/` 下还没有任何日期。要么等定时任务首次运行，要么用 `--backfill-days` 重跑、或手动补采某天（见上）。
+- **选了某天但列表为空？** 该 UTC 日可能确实没有会话日志；或拆分 Lambda 仍在后台处理（稍等片刻刷新）。CloudWatch 只有产生真实会话时才有日志。
+- **定时几点跑、跑的是哪天？** 定时时间看 `--schedule-cron`（UTC）；每次固定处理**昨天（UTC）整天**，与几点跑无关。
+- **切换日期为什么会整页刷新？** 为完整复用现有 `app.js` 渲染逻辑而采用刷新；已用 `sessionStorage` 暂存会话，刷新不需要重新登录（除非 token 过期或关闭标签页）。
+- **当天日志很大导致采集超时/内存不足？** 采集 Lambda 默认 900s 超时、`--lambda-memory` 内存；日志量很大时调大 `--lambda-memory`（如 `8192`/`10240`）。上传采用 multipart 流式，内存占用受单个分片大小约束。
