@@ -6,7 +6,7 @@
 |------|------|
 | [`setup-connect-ai-agent-logs.sh`](./setup-connect-ai-agent-logs.sh) | 一键配置脚本，幂等可重复执行 |
 | [`setup-connect-ai-agent-logs-check.sh`](./setup-connect-ai-agent-logs-check.sh) | 只读体检脚本，排查"日志组建好了却没有日志"的问题（见下方章节）|
-| [`setup-connect-ai-agent-logs-analysis.sh`](./setup-connect-ai-agent-logs-analysis.sh) | 拉取两路日志、按 Contact ID 关联并本地可视化排查（见文末章节）|
+| [`setup-connect-ai-agent-logs-analysis.sh`](./setup-connect-ai-agent-logs-analysis.sh) | 加载本地/S3 的日志文件或目录，按 Contact ID 关联并本地可视化排查（见文末章节）|
 | [`setup-connect-ai-agent-logs-analysis-in-cloudfront.sh`](./setup-connect-ai-agent-logs-analysis-in-cloudfront.sh) | 同上，但把排查页面部署到 CloudFront，并用 Cognito 登录鉴权（见文末章节）|
 | [`setup-connect-ai-agent-logs-analysis-in-cloudfront-scheduled.sh`](./setup-connect-ai-agent-logs-analysis-in-cloudfront-scheduled.sh) | 在 CloudFront 版之上增加**定时按天采集**（每天定时处理昨天 UTC 整天日志），页面顶部新增**日期控件**按天查看 Contact 列表（见文末章节）|
 | [`load-cloudwatch-logs.sh`](./load-cloudwatch-logs.sh) | 按日志组 ARN 下载全部日志并打包 zip（见文末章节）|
@@ -230,22 +230,28 @@ aws logs tail "/aws/connect/ai-agent-logs" --region <your-region> --follow
 
 # 日志解析与可视化排查（setup-connect-ai-agent-logs-analysis.sh）
 
-本脚本从配置文件 `config.env` 指定的**两个 CloudWatch 日志组**实时拉取日志，按 **Contact ID 关联**成可视化时间线，生成静态 HTML 页面并**在本地预览**：
+本脚本**只从已有日志文件构建页面，不连 CloudWatch**：输入可以是**单个日志文件**，也可以是**一个目录**（加载该目录下的所有日志文件），两者都支持**本地路径**与 **S3 地址**（`s3://...`）。加载后按 **Contact ID 关联**成可视化时间线，生成静态 HTML 页面并**在本地预览**。
+
+页面同时容纳两路日志：
 
 1. **Amazon Connect AI Agent 日志**（会话编排 / LLM 调用 / trace / 转人工）
 2. **Bedrock AgentCore Gateway 应用日志**（MCP server / 工具调用 / 网关错误）
+
+日志文件从哪来：用 [`load-cloudwatch-logs.sh`](./load-cloudwatch-logs.sh) 从 CloudWatch 导出、页面上每个 Contact 的「下载 CSV」、CloudWatch 控制台导出，或 S3 里已归档的日志。
 
 把两路日志放在同一条时间线上，排查「AI 说要调用某工具 → 网关实际执行情况」这类跨系统问题时一眼可见。排查能力参考官方 Workshop：[Logging & Observability · CloudWatch](https://catalog.workshops.aws/amazon-connect-ai-agents/en-US/01-foundation/09-logging-observability/05-cloudwatch)。
 
 | 文件 | 说明 |
 |------|------|
-| [`setup-connect-ai-agent-logs-analysis.sh`](./setup-connect-ai-agent-logs-analysis.sh) | 读配置 → 拉两路 CloudWatch 日志 → 关联构建 → 本地预览 |
-| [`config.env.example`](./config.env.example) | 配置模板（占位符）；复制为 `config.env` 后填入真实 ARN |
+| [`setup-connect-ai-agent-logs-analysis.sh`](./setup-connect-ai-agent-logs-analysis.sh) | 加载日志文件/目录（本地或 S3）→ 关联构建 → 本地预览 |
+| [`config.env.example`](./config.env.example) | 配置模板（占位符）；复制为 `config.env` 后填入真实 ARN。**本脚本不再读取它**，仅 CloudFront 版与补充数据脚本使用 |
 | `config.env` | 你的实际配置（含账号/ARN，已在 `.gitignore` 中，不提交）|
-| `lib/parse-connect-ai-logs.py` | 归一化两路日志并按 Contact ID 关联成 `data.js` |
+| `lib/parse-connect-ai-logs.py` | 归一化两路日志（可多文件、支持 `.gz`）并按 Contact ID 关联成 `data.js` |
 | `lib/web/index.html`、`lib/web/app.js` | 排查页面（前端按 Contact ID 分组、解析事件、还原对话）|
 
 ## 配置文件（config.env）
+
+> 本脚本**不读取** `config.env`（它只加载你给的日志文件/目录）。下面的配置供 [`load-cloudwatch-logs.sh`](./load-cloudwatch-logs.sh)、CloudFront 版部署脚本与补充数据脚本使用，页面默认界面语言也来自这里。
 
 仓库只提供模板 `config.env.example`，首次使用时复制一份并填入自己的日志组 ARN：
 
@@ -307,34 +313,55 @@ python3 lib/fetch-connect-contact-details.py \
 ```bash
 chmod +x setup-connect-ai-agent-logs-analysis.sh
 
-# 首次使用先准备配置文件
-cp config.env.example config.env   # 然后编辑 config.env 填入两个日志组 ARN
-
-# 读取 config.env，拉取最近 24 小时两路日志并启动本地预览(默认行为)
-./setup-connect-ai-agent-logs-analysis.sh
+# 1) 单个本地文件
+./setup-connect-ai-agent-logs-analysis.sh ./contact-29418ef1-a98a-4496-994f-2078737e236b-logs.csv
 # 浏览器打开 http://localhost:8080
 
-# 自定义时间范围 / 端口 / 配置文件
-./setup-connect-ai-agent-logs-analysis.sh --hours 6 --port 9000
-./setup-connect-ai-agent-logs-analysis.sh --config ./my.env
+# 2) 本地目录(递归加载目录下所有日志文件, 自动按 timestamp+message 去重)
+./setup-connect-ai-agent-logs-analysis.sh ./cloudwatch-logs-20260707-021617
 
-# 只构建不预览
-./setup-connect-ai-agent-logs-analysis.sh --no-serve
+# 3) S3 单个文件
+./setup-connect-ai-agent-logs-analysis.sh s3://my-bucket/logs/contact-xxxx-logs.csv --region eu-central-1
+
+# 4) S3 目录(前缀)
+./setup-connect-ai-agent-logs-analysis.sh s3://my-bucket/logs/ --region eu-central-1
+
+# 额外挂上 Gateway 日志做跨源关联 / 换端口 / 只构建不预览
+./setup-connect-ai-agent-logs-analysis.sh ./connect-events.log --gateway ./gateway-events.log
+./setup-connect-ai-agent-logs-analysis.sh ./logs-dir --port 9000
+./setup-connect-ai-agent-logs-analysis.sh ./logs-dir --no-serve
+
+# 不带参数时会交互式询问日志文件/目录
+./setup-connect-ai-agent-logs-analysis.sh
 ```
 
 ### 参数
 
 | 参数 | 说明 | 默认 |
 |------|------|------|
-| `--config <file>` | 配置文件路径 | `./config.env` |
-| `--hours <n>` | 拉取最近 n 小时日志 | `24` |
+| `<path>` / `--input <path>` | 日志文件或目录；本地路径或 `s3://` 地址 | 交互式询问 |
+| `--gateway <path>` | 额外的 AgentCore Gateway 日志（文件或目录，本地或 `s3://`）| 无 |
+| `--region <r>` | 访问 S3 时使用的区域 | AWS CLI 默认 |
+| `--profile <p>` | 访问 S3 时使用的 AWS CLI profile | 默认凭证 |
 | `--out-dir <dir>` | 站点构建输出目录 | `./dist` |
 | `--no-serve` | 只构建，不启动本地预览 | 默认会启动 |
 | `--port <n>` | 本地预览端口 | `8080` |
 
+### 支持的日志格式
+
+内容自动识别，目录模式下按扩展名筛选 `.csv` / `.json` / `.jsonl` / `.log` / `.txt` / `.gz`：
+
+- 页面「下载 CSV」导出的多列 CSV（`timestamp_ms,datetime,source,event_type,message,...`）
+- 简单两列 CSV（`timestamp,message`）
+- `aws logs filter-log-events` 的 JSON
+- `load-cloudwatch-logs.sh` 生成的 `events.log` / `events.json`
+- 以上格式的 `.gz` 压缩文件
+
+两路日志的区分：文件名含 `gateway` / `agentcore` 的按 Gateway 日志处理，或用 `--gateway` 显式指定；CSV 带 `source` 列时以该列为准（同一批文件可混装两路日志）。
+
 > 若指定端口被占用，脚本会自动向后顺延探测一个空闲端口（最多 +20）并在该端口启动预览。
 
-> 需要 aws cli v2 且已配置凭证，执行身份需具备目标两个日志组的 `logs:FilterLogEvents` 权限。
+> 只有输入是 `s3://` 时才需要 aws cli v2 与凭证（权限：目标对象/前缀的 `s3:GetObject`、`s3:ListBucket`）；纯本地文件只需 `python3`。S3 内容会先下载到 `<out-dir>/_input/` 再解析。
 
 ## 核心概念：Contact ID 与跨源关联
 
@@ -362,27 +389,30 @@ cp config.env.example config.env   # 然后编辑 config.env 填入两个日志�
 ## 构建流程
 
 ```
-CONNECT_AI_AGENT_LOG_ARN ─┐
-                          ├─ aws logs filter-log-events(自动翻页)
-BEDROCK_..._GATEWAY_LOG_ARN ┘            │
-                                         ▼
+本地文件 / 本地目录 ─┐
+                     ├─ (S3 输入先 aws s3 cp / s3 sync 到 <out-dir>/_input/)
+s3://.../file|prefix ┘            │
+                                  ▼
+              收集日志文件(目录递归 + 扩展名筛选 + 按文件名分两路)
+                                  │
+                                  ▼
               parse-connect-ai-logs.py  → dist/data.js
-              (归一化 + 修复非法 JSON 转义 + 按 Contact ID 关联两路日志)
+              (多文件合并去重 + 解压 .gz + 修复非法 JSON 转义 + 按 Contact ID 关联两路日志)
                           │  + index.html + app.js
                           ▼
-              本地静态站点 → python3 -m http.server → 浏览器排查页面
+              本地静态站点 → lib/serve.py → 浏览器排查页面
 ```
 
 - 站点是**纯静态**，`data.js` 在构建时生成；日志更新后重新执行脚本即可刷新数据。
-- 拉取与构建在本地完成，不会把会话内容上传到任何外部服务。
+- 解析与构建都在本地完成，不会把会话内容上传到任何外部服务。
 
 > 注意：`data.js` 中包含完整会话内容（可能含 PII）。请仅在受信任的本机环境查看，不要把 `dist/` 目录直接对外公开。
 
 ## 常见问题
 
-- **页面空白 / 没有 Contact**：确认两个日志组在所选时间范围内确有日志；可加大 `--hours`。CloudWatch 只有在产生真实会话时才会投递。
-- **Gateway 日志都进了「未关联」分组**：说明网关日志里既没有出现 contactId/sessionId，时间上也没落入任一会话窗口。可确认两个日志组属于同一套环境、时钟一致，或加大时间范围。
-- **拉不到日志**：检查 `config.env` 里的 ARN、region 是否正确，以及当前身份是否有对应日志组的 `logs:FilterLogEvents` 权限。
+- **页面空白 / 没有 Contact**：脚本会打印每个文件解析出的条数，先看是不是 0。常见原因是输入文件不是上面列出的格式，或目录里的日志文件扩展名不在筛选范围内（`.csv/.json/.jsonl/.log/.txt/.gz`）。
+- **Gateway 日志都进了「未关联」分组**：说明网关日志里既没有出现 contactId/sessionId，时间上也没落入任一会话窗口。可确认两路日志属于同一套环境、时钟一致，或时间范围有重叠。
+- **S3 地址读不到**：单个对象不要带结尾的 `/`；前缀建议带 `/`。脚本会先用 `head-object` 判断是对象还是前缀，判断失败会按前缀 `s3 sync`。跨区域时用 `--region`，多套凭证时用 `--profile`。
 - **日志里有非法 JSON 导致解析失败？** 解析脚本会把模型多行输出产生的「反斜杠+换行」等非法转义自动修复，并重新序列化成合法 JSON 写入 `data.js`；Gateway 的纯文本日志则原样保留。
 - **拷贝按钮不生效？** 浏览器的剪贴板 API 仅在安全上下文（`localhost` 或 HTTPS）可用；本地预览用 `localhost` 即可。若仍不可用，脚本前端会自动回退到兼容方式，必要时弹出文本框供手动复制。
 - **下载的 CSV 里都有什么？** 该 Contact 名下的全部事件（Connect + Gateway），按时间排序，列为 `timestamp_ms, datetime, source, event_type, message`，`message` 为原始日志内容。文件带 UTF-8 BOM，Excel 可直接正确识别中文。

@@ -6,9 +6,11 @@ parse-connect-ai-logs.py
   1) Amazon Connect AI Agent 日志       (source = "connect")
   2) Bedrock AgentCore Gateway 应用日志  (source = "gateway")
 
-输入(每路二选一格式，按扩展名/内容自动识别):
-  --connect FILE   Connect AI Agent 日志: filter-log-events 的 JSON，或控制台导出的 CSV
-  --gateway FILE   Bedrock AgentCore Gateway 日志: 同上(可选)
+输入(可给多个文件，按内容自动识别格式；支持 .gz):
+  --connect FILE [FILE ...]  Connect AI Agent 日志: filter-log-events JSON /
+                             events.log(制表符) / CSV(含页面导出的多列 CSV)
+  --gateway FILE [FILE ...]  Bedrock AgentCore Gateway 日志: 同上(可选)
+  CSV 若带 source 列(connect/gateway)，按该列归类，可混装在同一批文件里。
 
 输出:
   --out FILE       生成 data.js: window.__CONNECT_AI_LOG_DATA__ = [...]
@@ -28,7 +30,9 @@ parse-connect-ai-logs.py
 import argparse
 import csv
 import datetime
+import gzip
 import json
+import os
 import re
 import sys
 
@@ -69,16 +73,22 @@ def sanitize_message(msg):
 # ---------------------------------------------------------------------------
 # 读取: 自动识别 filter-log-events JSON / 控制台导出 CSV
 # ---------------------------------------------------------------------------
+def _open_text(path, newline=None):
+    """按文本方式打开日志文件，自动处理 .gz(CloudWatch 导出任务产物)。"""
+    if str(path).lower().endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace", newline=newline)
+    return open(path, "r", encoding="utf-8", errors="replace", newline=newline)
+
+
 def load_any(path, source):
     """返回 [{timestamp, message, source}]，自动识别 JSON / 制表符文本(.log) / CSV。"""
-    with open(path, "r", encoding="utf-8") as f:
-        head = f.read(1)
-    if head == "{" or head == "[":
+    with _open_text(path) as f:
+        first = f.readline()
+    head = first.lstrip("\ufeff").lstrip()[:1]
+    if head in ("{", "["):
         return _load_events_json(path, source)
     # 探测 load-cloudwatch-logs.sh 生成的 events.log:
     #   "<datetime>\t<logStreamName>\t<message>"，制表符分隔且首列是时间戳
-    with open(path, "r", encoding="utf-8") as f:
-        first = f.readline()
     if "\t" in first and _parse_dt_ms(first.split("\t", 1)[0]) is not None:
         return _load_text_log(path, source)
     return _load_csv(path, source)
@@ -86,22 +96,40 @@ def load_any(path, source):
 
 def _parse_dt_ms(s):
     """把可读时间字符串解析成 epoch 毫秒；无法解析返回 None。"""
-    s = (s or "").strip()
+    s = (s or "").strip().lstrip("\ufeff")
+    if not s:
+        return None
     for fmt in ("%Y-%m-%d %H:%M:%S.%fZ", "%Y-%m-%d %H:%M:%SZ",
-                "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+                "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
         try:
             dt = datetime.datetime.strptime(s, fmt).replace(tzinfo=datetime.timezone.utc)
             return int(dt.timestamp() * 1000)
         except ValueError:
             continue
-    return None
+    try:  # 兜底: 其它 ISO-8601 变体
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def _to_ms(v):
+    """把 CSV 里的时间列(epoch 毫秒/秒 或可读时间)统一成 epoch 毫秒。"""
+    s = str(v or "").strip().lstrip("\ufeff").strip('"')
+    if re.fullmatch(r"\d+", s):
+        n = int(s)
+        return n * 1000 if n < 10 ** 11 else n   # 10 位视为秒
+    return _parse_dt_ms(s)
 
 
 def _load_text_log(path, source):
     """读取制表符分隔的 events.log；跨多行的 message 会被并回同一条记录。"""
     rows = []
     cur = None
-    with open(path, "r", encoding="utf-8") as f:
+    with _open_text(path) as f:
         for line in f:
             line = line.rstrip("\n")
             parts = line.split("\t", 2)
@@ -121,7 +149,7 @@ def _load_text_log(path, source):
 
 
 def _load_events_json(path, source):
-    with open(path, "r", encoding="utf-8") as f:
+    with _open_text(path) as f:
         data = json.load(f)
     if isinstance(data, dict):
         events = data.get("events", [])
@@ -139,20 +167,51 @@ def _load_events_json(path, source):
     return rows
 
 
+# CSV 表头别名: 兼容 `timestamp,message` 的简单导出、CloudWatch 控制台导出，
+# 以及本工具页面「下载 CSV」产出的多列格式(timestamp_ms,datetime,source,event_type,message,...)
+_TS_HEADERS = ("timestamp_ms", "timestamp", "@timestamp", "time", "datetime", "epoch_ms")
+_MSG_HEADERS = ("message", "@message", "msg", "raw", "log", "raw_message")
+
+
 def _load_csv(path, source):
     rows = []
     csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
-    with open(path, "r", encoding="utf-8", newline="") as f:
+    with _open_text(path, newline="") as f:
         reader = csv.reader(f)
-        next(reader, None)  # 跳过表头 timestamp,message
-        for rec in reader:
-            if not rec or len(rec) < 2:
+        header = next(reader, None)
+        if not header:
+            return rows
+
+        norm = [(h or "").strip().lstrip("\ufeff").strip('"').lower() for h in header]
+
+        def find(names):
+            for i, h in enumerate(norm):
+                if h in names:
+                    return i
+            return None
+
+        ts_idx, msg_idx = find(_TS_HEADERS), find(_MSG_HEADERS)
+        src_idx = find(("source",))
+        pending = []
+        if ts_idx is None or msg_idx is None:
+            # 没有可识别的表头 -> 按 `timestamp,message` 两列处理，且首行也是数据
+            ts_idx, msg_idx, src_idx = 0, 1, None
+            pending = [header]
+
+        for rec in pending + list(reader):
+            if not rec or len(rec) <= max(ts_idx, msg_idx):
                 continue
-            try:
-                ts = int(rec[0])
-            except (ValueError, TypeError):
+            ts = _to_ms(rec[ts_idx])
+            if ts is None:
                 continue
-            rows.append({"timestamp": ts, "message": sanitize_message(rec[1]), "source": source})
+            row_source = source
+            if src_idx is not None and len(rec) > src_idx:
+                s = (rec[src_idx] or "").strip().lower()
+                if s in ("connect", "gateway"):
+                    row_source = s
+            rows.append({"timestamp": ts,
+                         "message": sanitize_message(rec[msg_idx]),
+                         "source": row_source})
     return rows
 
 
@@ -234,13 +293,44 @@ def correlate(connect_rows, gateway_rows):
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="Normalize & correlate Connect AI Agent + AgentCore Gateway logs into data.js")
-    ap.add_argument("--connect", required=True, help="Connect AI Agent 日志文件(filter-log-events JSON 或 CSV)")
-    ap.add_argument("--gateway", help="Bedrock AgentCore Gateway 日志文件(filter-log-events JSON 或 CSV)")
+    ap.add_argument("--connect", required=True, nargs="+", metavar="FILE",
+                    help="Connect AI Agent 日志文件(可多个; JSON / events.log / CSV, 支持 .gz)")
+    ap.add_argument("--gateway", nargs="*", default=[], metavar="FILE",
+                    help="Bedrock AgentCore Gateway 日志文件(可多个, 可选)")
     ap.add_argument("--out", required=True, help="输出的 data.js 路径")
     args = ap.parse_args()
 
-    connect_rows = load_any(args.connect, "connect")
-    gateway_rows = load_any(args.gateway, "gateway") if args.gateway else []
+    connect_rows, gateway_rows = [], []
+    seen = set()  # (timestamp, message) 去重: 同一事件可能出现在目录里的多个文件中
+    skipped = 0
+
+    def take(path, default_source):
+        nonlocal skipped
+        try:
+            loaded = load_any(path, default_source)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            sys.stderr.write("  跳过无法解析的文件 %s: %s\n" % (path, e))
+            skipped += 1
+            return
+        kept = 0
+        for r in loaded:
+            key = (r["timestamp"], r["message"])
+            if key in seen:
+                continue
+            seen.add(key)
+            (gateway_rows if r.get("source") == "gateway" else connect_rows).append(r)
+            kept += 1
+        sys.stderr.write("  %s: %d 条%s\n"
+                         % (os.path.basename(path), kept,
+                            "" if kept == len(loaded) else " (去重后, 原 %d 条)" % len(loaded)))
+
+    for p in args.connect:
+        take(p, "connect")
+    for p in args.gateway or []:
+        take(p, "gateway")
+
+    if not connect_rows and not gateway_rows:
+        sys.stderr.write("警告: 未从输入文件解析出任何事件。\n")
 
     correlate(connect_rows, gateway_rows)
 
