@@ -236,7 +236,29 @@ Step Functions 状态机按顺序编排以下 Lambda（`src/` 下同名文件）
 
 第 4/5/6 步在 `Parallel` 状态中**并发**执行（已验证同账号允许多个批量评估任务同时进行）；Insights 与 Recommendation 各自带 `Catch`，单个环节失败不会拖垮整条流水线。
 
-`converter.py` 是从上一级目录参考实现移植过来的转换器，含一处修正：Connect 的 `system_instructions` 是 MESSAGE 对象列表，提示词文本位于 `values[i].text.value`，此前按列表项直接取 `value` 会得到空字符串，导致 `Builtin.InstructionFollowing` 评分失真。
+`converter.py` 是从上一级目录参考实现移植过来的转换器，含若干修正。每一条都以「评分会失真」为代价，改动前后都用同一个真实会话跑过对比：
+
+- **`system_instructions` 是 MESSAGE 对象列表**，提示词文本位于 `values[i].text.value`；此前按列表项直接取 `value` 会得到空字符串，`Builtin.InstructionFollowing` 因此失真。
+- **`input_messages` 是逆序的**（`output_messages` 是正序）。按原样读取会把对话倒着喂给评估器。现在按每条 MESSAGE 自带的 `timestamp` 排序。
+- **一次助手回答被拆成多条 MESSAGE**：可见回复、推理（`reasoning`）、每个工具调用各一条。推理那条没有 text，被当成独立消息时整轮就以一条空的 `<NO_RESPONSE>` 结尾，质量类评估器于是判定「助手没有回答」。现在推理不再单独成条，回复与工具调用合并回同一轮。
+- **部分 agent 会多出一条「累计」客户消息**（把此前所有客户话语用空格连起来），读起来像用户侧被复制了一份，Insights 的意图聚类里就是那些越来越长的字符串。现在按内容识别并去掉。
+- **AGENT span 的 `input.messages` 必须以用户消息结尾**：评估器从末尾读该轮的 user query，否则整个会话以 `AgentSpanMappingException: Failed to parse user_query from agent-span` 失败。逆序读取时这一点是碰巧成立的（最老的消息排在最后，而最老的消息是客户话语）。现在显式截到最后一条用户消息；agent 自己发起的一轮（语音坐席的问候、"还在吗"）补一条 `<EMPTY_USER_INPUT>` 占位。
+
+同一会话（10 轮、6 次工具调用）修正前后的对比：
+
+| 评估器 | 修正前 | 修正后 |
+|--------|-------:|-------:|
+| `Builtin.Correctness` | 0.000 | 1.000 |
+| `Builtin.GoalSuccessRate` | 0.000 | 1.000 |
+| `Builtin.ResponseRelevance` | 0.000 | 1.000 |
+| `Builtin.Helpfulness` | 0.034 | 0.735 |
+| `Builtin.InstructionFollowing` | 0.800 | 1.000 |
+| `Builtin.Conciseness` | 0.700 | 0.500 |
+| `Builtin.ToolSelectionAccuracy` / `ToolParameterAccuracy` | 1.000 / 0.833 | 1.000 / 0.833 |
+
+修正前那些 0 分不是「没评上」，而是**评错了**：评估器拿到的候选回复是 `<NO_RESPONSE>`（30 个 turn 里有 20 个），解释里写的就是 "the assistant provided no actual response"。`Conciseness` 下降是正常的——它现在评的是真实回复（含寒暄）而不是空消息。
+
+> 批量评估作业只要「会话」跑完就报 `COMPLETED`，即使其中大部分 span 因为映射失败没打上分。所以 `summary.json` 与 `index.html` 里会显式列出 `evaluationsFailed`（按评估器统计失败数），并在页面顶部标红——一页看着合理、实际只覆盖了少数 span 的结果，是最容易被误信的那种。
 
 ---
 
@@ -271,6 +293,57 @@ Step Functions 状态机按顺序编排以下 Lambda（`src/` 下同名文件）
 
 另外，超过 **14 天**的会话会被显式跳过并在 `collect.json` 的 `skipped.too_old` 中列出——CloudWatch `PutLogEvents` 拒绝 14 天以前的事件，这类会话在技术上无法再被 AgentCore 发现。
 
+
+## 排错：状态机以 `LogEventsNotIndexed` 结束
+
+WaitIndexed 连续 5 次都判定「数据还没被索引」时，状态机会以 `LogEventsNotIndexed` 失败。
+先分清两种情况——**数据真的没到**，还是**判定用的查询看不见已经到了的数据**：
+
+```bash
+REGION=<region>
+# 取一个本次注入的 spanId（ingest.json 里有）
+SID=<spanId>
+
+# A. 原始文本里在不在？(不依赖字段自动发现)
+aws logs start-query --region "$REGION" --log-group-name aws/spans \
+  --start-time $(( $(date +%s) - 7200 )) --end-time $(date +%s) \
+  --query-string "fields @message | filter @message like /$SID/ | limit 5"
+
+# B. 作为字段能不能过滤？
+aws logs start-query --region "$REGION" --log-group-name aws/spans \
+  --start-time $(( $(date +%s) - 7200 )) --end-time $(date +%s) \
+  --query-string "fields spanId | filter spanId = '$SID' | limit 5"
+```
+
+用 `aws logs get-query-results --query-id <id>` 取结果，看 `statistics`：
+
+- **A 和 B 都是 0**：span 文档确实还没进 `aws/spans`。检查 Transaction Search 是否已启用
+  （`aws xray get-trace-segment-destination`，应为 `CloudWatchLogs` + `ACTIVE`）、`INDEXING_PERCENTAGE`
+  是否被调得过低、以及 ingest 步骤的 OTLP 调用是否真的返回 200。等待并重跑即可。
+- **A 有、B 是 0**：数据在库里，但 Logs Insights 没把 `spanId` 提升为可过滤字段（曾在
+  eu-central-1 遇到，`recordsScanned` 有值而 `recordsMatched` 恒为 0）。这一半的门永远打不开，
+  等多久都没用。`wait_indexed.py` 现在用 `parse @message` 从原始文本里抽 `spanId` 来判定，
+  不再依赖字段自动发现，所以这种情况已被覆盖；请确认 Lambda 代码是当前版本（重跑 `deploy.sh`）。
+  若某个区域仍然打不开这一半门，可以只跳过它：
+
+  ```bash
+  # config.env
+  REQUIRE_SPAN_INDEX="false"
+  ```
+
+  跳过后运行时日志组那一半仍然要等（它决定 `LogEventMissingException`），span 这一半交给评估作业
+  去报真实结果，而不是卡在门上超时。
+
+判定查询本身也可以直接在本机验证——它就是 `wait_indexed.py` 里的 `PARSE_QUERY`：
+
+```
+parse @message /"spanId":\s*"(?<sid>[0-9a-fA-F]{16})"/ | filter ispresent(sid) | stats count(*) by sid | limit 10000
+```
+
+`aws/spans` 由 X-Ray 写入、是紧凑 JSON（`"spanId":"..."`），运行时日志组由本流水线用
+`json.dumps` 写入、冒号后有空格（`"spanId": "..."`），所以模式里的 `\s*` 不能去掉。
+
+---
 
 ## 成本提示
 

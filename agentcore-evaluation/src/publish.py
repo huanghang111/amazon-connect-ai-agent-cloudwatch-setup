@@ -252,6 +252,15 @@ def render_index(summary, run_id):
     rows = "".join(
         f"<tr><td>{k}</td><td style='text-align:right'>{v:.3f}</td></tr>"
         for k, v in sorted(ev.items()))
+    failed = summary.get("evaluationsFailed") or {}
+    # loud, because a page full of plausible scores over a handful of mapped spans
+    # is the failure mode that gets believed
+    failed_note = ("<p style='color:#b3261e'><b>" + str(sum(failed.values()))
+                   + " evaluations failed to map to a span</b> (see "
+                   "<code>evaluationsFailed</code> in summary.json and "
+                   "<code>error.message</code> in the results log stream): "
+                   + ", ".join(f"{k} x{v}" for k, v in sorted(failed.items()))
+                   + "</p>") if failed else ""
     intents = summary.get("userIntents") or []
     intent_rows = "".join(
         f"<tr><td>{i.get('name')}</td><td style='text-align:right'>"
@@ -270,6 +279,7 @@ code{{background:#f4f3ee;padding:1px 4px;border-radius:3px}}</style>
 <p>{summary['sessionsEvaluated']} sessions evaluated &middot;
 {summary['totalEvaluations']} individual evaluations &middot;
 window {summary['window']['hours']}h</p>
+{failed_note}
 <h2>Scores by evaluator</h2><table><tr><th>Evaluator</th><th>Mean</th></tr>
 {rows}</table>
 <h2>Charts</h2>
@@ -329,6 +339,14 @@ def handler(event, context):
                               for ev, s in data.items()},
         "evaluationJobs": [{"jobId": j.get("jobId"), "status": j.get("status")}
                            for j in eval_jobs],
+        # A job reports COMPLETED as long as the SESSION completed, even when most
+        # of its spans could not be mapped and scored (AgentSpanMappingException,
+        # ToolSpanMappingException). Those are exactly the runs that look healthy
+        # and are not, so the per-evaluator failure counts are surfaced here.
+        "evaluationsFailed": {
+            s["evaluatorId"]: s.get("totalFailed", 0)
+            for j in eval_jobs for s in (j.get("evaluatorSummaries") or [])
+            if s.get("totalFailed")},
         "insightJobs": [{"jobId": j.get("jobId"), "status": j.get("status")}
                         for j in insight_jobs],
         "userIntents": intents,

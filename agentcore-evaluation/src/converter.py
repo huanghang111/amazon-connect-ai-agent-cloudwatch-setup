@@ -6,6 +6,24 @@ Output: per-session sessionSpans list (spans + events) compatible with
 
 Only TRANSCRIPT_AI_AGENT_TRACE events are needed - they carry the complete span
 tree (invoke_agent / inference / execute_tool) with messages and token usage.
+
+Three properties of Connect's message lists have to be undone before the result
+is a conversation (all three verified against the matching
+TRANSCRIPT_LARGE_LANGUAGE_MODEL_INVOCATION record, which shows the prompt the
+model actually received):
+
+  * `input_messages` is REVERSE chronological; `output_messages` is forward. Every
+    MESSAGE carries its own `timestamp`, so both are sorted by it.
+  * one assistant turn is split across several MESSAGE objects: the visible reply,
+    the reasoning, then one per tool call. The reasoning one has no text block, so
+    taken literally the turn ended on an empty message and quality evaluators
+    scored it as "the assistant did not answer".
+  * some agents add a running-total customer message holding every utterance so
+    far joined with spaces, which reads as a second copy of the user side.
+
+Known deviation: when a turn issues several tool calls, they are grouped as
+`assistant[use, use, use]` + one `tool` message per result, whereas the model's
+own prompt interleaves them use/result. Same calls, same ids, same order.
 """
 
 import csv
@@ -80,6 +98,105 @@ def otel_trace_id(root_uuid: str, salt: str = "") -> str:
 
 # ---------------------------------------------------------------- messages
 
+def message_blocks(m):
+    """One Connect MESSAGE -> (content blocks, has_tool, is_tool_result).
+
+    Only the values that are part of the conversation become blocks. A "reasoning"
+    value is the model's internal chain of thought, which Connect logs as its OWN
+    MESSAGE next to the visible reply; it must not become a message of its own
+    (see conversation_messages) and must not be graded as if it were the answer.
+    """
+    blocks, has_tool, is_tool_result = [], False, False
+    for v in m.get("values", []):
+        if "text" in v:
+            txt = v["text"].get("value", "").strip()
+            if txt:
+                blocks.append({"text": txt})
+        elif "toolUse" in v:
+            tu = v["toolUse"]
+            inp = tu.get("input")
+            if isinstance(inp, str):
+                try:
+                    inp = json.loads(inp, strict=False)
+                except json.JSONDecodeError:
+                    pass
+            blocks.append({"toolUse": {"toolUseId": tu.get("toolUseId"),
+                                       "name": tu.get("name"), "input": inp}})
+            has_tool = True
+        elif "toolResult" in v:
+            tr_ = v["toolResult"]
+            # Connect uses either "content" (blocks) or "value" (string)
+            blocks.append({"toolResult": {"toolUseId": tr_.get("toolUseId"),
+                                          "status": "success",
+                                          "content": tool_result_blocks(tr_)}})
+            has_tool, is_tool_result = True, True
+    return blocks, has_tool, is_tool_result
+
+
+def _user_text(m):
+    return " ".join(" ".join(v["text"].get("value", "")
+                             for v in m.get("values", []) if "text" in v).split())
+
+
+def drop_aggregate_user_message(msgs):
+    """Remove Connect's running-total customer message, if present.
+
+    Alongside the real turns, Connect adds one extra CUSTOMER message per
+    inference span whose text is every customer utterance so far joined with
+    spaces ("hi, I have some device defect 7646 it's an oven ..."). It carries the
+    oldest timestamp, so it sorts to the front of the conversation and reads as a
+    second copy of the whole user side - which is what showed up as those
+    ever-growing strings in the Insights user-intent clusters.
+
+    Identified by content, not position: the message whose text equals the other
+    customer texts joined in order. At most one is dropped, so a genuine repeated
+    utterance survives (with two identical utterances either one may go, and the
+    conversation is the same afterwards).
+    """
+    users = [m for m in msgs if m.get("participant") == "CUSTOMER"]
+    if len(users) < 2:
+        return msgs
+    for cand in users:
+        others = [_user_text(u) for u in users if u is not cand]
+        if all(others) and _user_text(cand) == " ".join(others):
+            return [m for m in msgs if m is not cand]
+    return msgs
+
+
+def conversation_messages(msgs):
+    """Connect MESSAGE list -> one logical message per conversation turn.
+
+    Connect splits a single assistant turn across several MESSAGE objects - the
+    visible reply, the reasoning, then one per tool call - and logs
+    input_messages in REVERSE chronological order (output_messages is forward).
+    Taken literally, that produced a conversation that ran backwards and ended on
+    an empty "<NO_RESPONSE>" assistant message (the reasoning one, which has no
+    text block), so every quality evaluator scored the turn as "the assistant did
+    not answer" even though it had. Hence: sort by the per-message timestamp,
+    drop the running-total user message, drop what is not conversation, and merge
+    what belongs to one turn back together.
+    """
+    out = []
+    for m in drop_aggregate_user_message(sorted(msgs, key=lambda x: x.get("timestamp") or 0)):
+        blocks, has_tool, is_tool_result = message_blocks(m)
+        if not blocks:
+            continue                       # reasoning-only: not a turn of its own
+        role = ("tool" if is_tool_result
+                else "user" if m.get("participant") == "CUSTOMER" else "assistant")
+        prev = out[-1] if out else None
+        # reply + tool calls are one assistant turn; a toolResult always stands alone
+        if prev and prev["role"] == role == "assistant" and not is_tool_result \
+                and not prev["is_tool_result"]:
+            prev["blocks"] += blocks
+            prev["has_tool"] = prev["has_tool"] or has_tool
+        elif prev and prev["role"] == role and prev["blocks"] == blocks:
+            continue                       # same turn logged twice
+        else:
+            out.append({"role": role, "blocks": blocks, "has_tool": has_tool,
+                        "is_tool_result": is_tool_result})
+    return out
+
+
 def connect_messages_to_otel(raw: str, direction: str):
     """Connect input_messages/output_messages JSON -> Strands-style gen_ai
     messages. direction: 'input' | 'output' (controls content shape)."""
@@ -89,40 +206,20 @@ def connect_messages_to_otel(raw: str, direction: str):
         msgs = json.loads(raw, strict=False)
     except json.JSONDecodeError:
         return []
+    turns = conversation_messages(msgs)
+    if msgs and not turns:
+        # nothing conversational survived (e.g. a reasoning-only span). The
+        # evaluator needs *something* on both sides of a span it maps, so keep the
+        # placeholder rather than an empty message list.
+        turns = [{"role": "assistant" if direction == "output" else "user",
+                  "blocks": [{"text": "<NO_RESPONSE>" if direction == "output"
+                              else "<EMPTY_USER_INPUT>"}],
+                  "has_tool": False, "is_tool_result": False}]
     out = []
-    for m in msgs:
-        role = "user" if m.get("participant") == "CUSTOMER" else "assistant"
+    for t in turns:
         # Strands-native content blocks. Recommendation's tool matching only
         # recognizes toolUse blocks in this exact shape (Evaluate is laxer).
-        blocks, has_tool = [], False
-        for v in m.get("values", []):
-            if "text" in v:
-                txt = v["text"].get("value", "").strip()
-                if txt:
-                    blocks.append({"text": txt})
-            elif "toolUse" in v:
-                tu = v["toolUse"]
-                inp = tu.get("input")
-                if isinstance(inp, str):
-                    try:
-                        inp = json.loads(inp, strict=False)
-                    except json.JSONDecodeError:
-                        pass
-                blocks.append({"toolUse": {"toolUseId": tu.get("toolUseId"),
-                                           "name": tu.get("name"), "input": inp}})
-                has_tool = True
-            elif "toolResult" in v:
-                tr_ = v["toolResult"]
-                role = "tool"
-                # Connect uses either "content" (blocks) or "value" (string)
-                content = tool_result_blocks(tr_)
-                blocks.append({"toolResult": {"toolUseId": tr_.get("toolUseId"),
-                                              "status": "success",
-                                              "content": content}})
-                has_tool = True
-        if not blocks:
-            blocks = [{"text": "<EMPTY_USER_INPUT>" if role == "user"
-                       else "<NO_RESPONSE>"}]
+        blocks, role, has_tool = t["blocks"], t["role"], t["has_tool"]
         text = "\n".join(b["text"] for b in blocks if "text" in b).strip()
         # mirror the shapes emitted by strands.telemetry.tracer
         if direction == "output" and role == "assistant":
@@ -134,6 +231,34 @@ def connect_messages_to_otel(raw: str, direction: str):
             content = text
         out.append({"role": role, "content": content})
     return out
+
+
+def trim_to_user_query(msgs):
+    """Cut an agent-span conversation off after its last user message.
+
+    An AGENT span represents one user turn, and the evaluator reads that turn's
+    user query from the END of input.messages: leave a tool result or an assistant
+    reply there and the whole session fails with
+
+        AgentSpanMappingException: Failed to parse user_query from agent-span
+        with spanId: <id> and scope: strands.telemetry.tracer
+
+    The turn's tool round trips are not lost - they are evaluated on the child
+    chat / execute_tool spans, which is also where Strands puts them.
+
+    (While input_messages was being read in Connect's reverse order this happened
+    to hold by accident: the oldest messages sorted last, and the oldest message
+    is a customer utterance.)
+
+    A turn the agent started on its own - a voice agent's greeting or "are you
+    still there?" - has no customer utterance to end on, so it gets the same
+    explicit placeholder the rest of the converter uses for that case.
+    """
+    for i in range(len(msgs) - 1, -1, -1):
+        if msgs[i]["role"] == "user":
+            return msgs[:i + 1]
+    return msgs + [{"role": "user", "content": {"content": json.dumps(
+        [{"text": "<EMPTY_USER_INPUT>"}], ensure_ascii=False)}}]
 
 
 def system_prompt_text(raw):
@@ -366,7 +491,8 @@ def build_session_spans(trace_events, session_id, salt=""):
                         and c["operation_name"] == "inference"]
             if children:
                 c = children[-1]
-                in_msgs = connect_messages_to_otel(c.get("input_messages", ""), "input")
+                in_msgs = trim_to_user_query(
+                    connect_messages_to_otel(c.get("input_messages", ""), "input"))
                 out_msgs = connect_messages_to_otel(c.get("output_messages", ""), "output")
                 sys_txt = system_prompt_text(c.get("system_instructions"))
                 if sys_txt:

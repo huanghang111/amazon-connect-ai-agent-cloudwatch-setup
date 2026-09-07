@@ -93,6 +93,16 @@ Parameters:
     Default: 30
     Description: How long an evaluated sessionId is remembered for deduplication.
 
+  RequireSpanIndex:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Whether WaitIndexed also waits for the span documents in aws/spans to become
+      queryable, not just the runtime log events. Set to false only if that half of
+      the gate never opens in your Region even though the spans are present; the
+      evaluation job then reports the truth instead of the gate timing out.
+
   Boto3LayerArn:
     Type: String
     Default: ''
@@ -442,6 +452,7 @@ Resources:
           RESULTS_BUCKET: !If [CreateBucket, !Ref ResultsBucket, !Ref ResultsBucketName]
           OBSERVABILITY_RUNTIME_NAME: !Ref ObservabilityRuntimeName
           INDEX_BUDGET_SECONDS: '180'
+          REQUIRE_SPAN_INDEX: !Ref RequireSpanIndex
 
   EvaluateFunction:
     Type: AWS::Lambda::Function

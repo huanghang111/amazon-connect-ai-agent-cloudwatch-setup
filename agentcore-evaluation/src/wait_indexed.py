@@ -27,6 +27,11 @@ budget runs out, re-write them with current timestamps -> let Step Functions
 retry -> only start evaluation once both sides are visible.
 
 Failing loudly here is much cheaper than a job that reports 0 completed sessions.
+The one thing to get right is that the gate must fail only when the data really
+is missing: both presence tests read the raw message instead of a discovered
+field (see PARSE_QUERY), because a query that can never match turns this gate
+into a deadlock. REQUIRE_SPAN_INDEX=false skips the aws/spans half if a region
+still refuses to cooperate.
 """
 
 import json
@@ -47,16 +52,48 @@ SPANS_LOG_GROUP = "aws/spans"
 POLL_SECONDS = int(os.environ.get("INDEX_POLL_SECONDS", "20"))
 # one Lambda invocation stays well inside its own timeout; Step Functions retries
 BUDGET_SECONDS = int(os.environ.get("INDEX_BUDGET_SECONDS", "180"))
+# escape hatch for a region where the "aws/spans" side of the gate cannot be made
+# to work at all: skip that half and let evaluation report the truth. Only the
+# gate is skipped, nothing about the data changes.
+REQUIRE_SPAN_INDEX = os.environ.get("REQUIRE_SPAN_INDEX", "true").lower() == "true"
 
 s3 = boto3.client("s3", region_name=REGION)
 logs = boto3.client("logs", region_name=REGION)
 
+# The gate must NOT depend on Logs Insights automatic JSON field discovery.
+#
+# A deployment in eu-central-1 (customer report, 2026-09) had the span documents
+# physically present in "aws/spans" - `fields @message` returned the full span
+# JSON and `filter @message like /spanId/` matched all 12 records - while
+# `filter ispresent(spanId)` matched 0 records, run after run (recordsScanned 12,
+# recordsMatched 0). Whatever the reason - spanId was simply not queryable as a
+# field there - `missing_spans` stayed at 100%, all 5 attempts burned, and every
+# run died in WaitIndexed with LogEventsNotIndexed while the data it was waiting
+# for was already there. It is region- or account-specific, not universal: the
+# same query works on aws/spans in us-east-1, so it cannot be relied on either
+# way.
+#
+# `parse` reads the raw message text, so it is independent of discovery, and this
+# pattern covers both serializations the gate has to read:
+#   aws/spans, written by X-Ray (compact)  ->  "spanId":"3d58446444af52bb"
+#   runtime log group, our own json.dumps  ->  "spanId": "3d58446444af52bb"
+# Checked against real data in us-east-1, where discovery does work, and it
+# returns exactly what the old query returned: 5/5 span documents in aws/spans,
+# 213/213 log events in a runtime log group. spanIds are md5[:16] (converter.py),
+# hence the fixed 16 hex digits.
+PARSE_QUERY = ('parse @message /"spanId":\\s*"(?<sid>[0-9a-fA-F]{16})"/'
+               " | filter ispresent(sid) | stats count(*) by sid | limit 10000")
+# Safety net for the opposite failure - a log group where the raw text does not
+# carry that shape but the field is discovered. Only run when parse finds nothing,
+# so the normal path stays at one query per log group per poll.
+DISCOVERED_QUERY = "fields spanId | filter ispresent(spanId) | limit 10000"
 
-def indexed_span_ids(log_group, start_epoch, end_epoch):
-    """spanIds visible to Logs Insights in `log_group` over [start, end]."""
+
+def query_span_ids(log_group, query, field, start_epoch, end_epoch):
+    """Values of `field` returned by `query` against `log_group` over [start, end]."""
     qid = logs.start_query(
         logGroupName=log_group, startTime=start_epoch, endTime=end_epoch,
-        queryString="fields spanId | filter ispresent(spanId) | limit 10000",
+        queryString=query,
     )["queryId"]
     while True:
         r = logs.get_query_results(queryId=qid)
@@ -64,12 +101,17 @@ def indexed_span_ids(log_group, start_epoch, end_epoch):
             break
         time.sleep(2)
     if r["status"] != "Complete":
+        print(f"query on {log_group} ended {r['status']}: {query}")
         return set()
-    found = set()
-    for row in r["results"]:
-        for f in row:
-            if f["field"] == "spanId":
-                found.add(f["value"])
+    return {f["value"] for row in r["results"] for f in row if f["field"] == field}
+
+
+def indexed_span_ids(log_group, start_epoch, end_epoch):
+    """spanIds visible to Logs Insights in `log_group` over [start, end]."""
+    found = query_span_ids(log_group, PARSE_QUERY, "sid", start_epoch, end_epoch)
+    if not found:
+        found = query_span_ids(log_group, DISCOVERED_QUERY, "spanId",
+                               start_epoch, end_epoch)
     return found
 
 
@@ -142,19 +184,25 @@ def handler(event, context):
     event_start = ingested_at - 600
 
     deadline = time.time() + BUDGET_SECONDS
-    missing_events, missing_spans = wanted, wanted
+    missing_events = wanted
+    missing_spans = wanted if REQUIRE_SPAN_INDEX else set()
     while time.time() < deadline:
         now = int(time.time())
         # both sides must be queryable; see module docstring for each failure mode
         missing_events = wanted - indexed_span_ids(LOG_GROUP, event_start, now + 600)
-        missing_spans = wanted - indexed_span_ids(SPANS_LOG_GROUP, span_start, now + 600)
+        missing_spans = set()
+        if REQUIRE_SPAN_INDEX:
+            missing_spans = wanted - indexed_span_ids(
+                SPANS_LOG_GROUP, span_start, now + 600)
         if not missing_events and not missing_spans:
             print(f"all {len(wanted)} spans indexed in both {SPANS_LOG_GROUP} "
                   f"and {LOG_GROUP}")
             return {"runId": run_id, "indexed": True, "missing": 0,
                     "indexAttempt": attempt}
-        print(f"waiting to index: {len(missing_spans)}/{len(wanted)} span "
-              f"documents, {len(missing_events)}/{len(wanted)} log events")
+        span_state = (f"{len(missing_spans)}/{len(wanted)} span documents"
+                      if REQUIRE_SPAN_INDEX else "span gate disabled")
+        print(f"waiting to index: {span_state}, "
+              f"{len(missing_events)}/{len(wanted)} log events")
         time.sleep(POLL_SECONDS)
 
     # Only the PutLogEvents side can be nudged by rewriting; span documents are
