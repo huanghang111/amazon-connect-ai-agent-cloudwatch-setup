@@ -148,6 +148,7 @@
   .ev-tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border); color: var(--muted); }
   .ev-tag.err { color: var(--red); border-color: var(--red); }
   .ev-tag.ok { color: var(--green); border-color: var(--green); }
+  .ev-tag.barge { color: var(--cyan); border-color: var(--cyan); }
 
   .event-body { display: none; padding: 0 12px 12px; }
   .event.open .event-body { display: block; }
@@ -217,6 +218,8 @@
   .event.role-tool { border-left: 3px solid var(--purple); background: rgba(163,113,247,.07); }
   .event.sev-guard { border-left: 3px solid var(--amber); background: rgba(210,153,34,.09); }
   .event.sev-err  { border-left: 3px solid var(--red);   background: rgba(248,81,73,.09); }
+  /* 用户打断(barge-in): 正常中止, 与错误区分开 */
+  .event.sev-barge { border-left: 3px solid var(--cyan); background: rgba(57,197,207,.08); }
 
   /* 图例 */
   .legend { display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
@@ -304,6 +307,20 @@
   }
   .summary-toggle:hover { text-decoration: underline; }
   .contact-table td.reason-cell { white-space: normal; min-width: 160px; max-width: 260px; }
+  /* 拦截原因: 每条护栏命中一行, 名称加粗, policyType / details 以标签形式跟随 */
+  .guard-reason { line-height: 1.5; word-break: break-word; }
+  .guard-reason + .guard-reason { margin-top: 4px; padding-top: 4px; border-top: 1px dashed var(--border); }
+  .guard-reason .guard-name { color: var(--amber); font-weight: 600; }
+  .guard-reason .guard-part {
+    display: inline-block; margin-left: 4px; padding: 0 5px;
+    border: 1px solid var(--border); border-radius: 4px;
+    background: var(--panel-2); font-size: 11px; color: var(--text);
+  }
+  /* 命中次数: 各行之和等于「拦截次数」列 */
+  .guard-reason .guard-count {
+    margin-left: 4px; font-size: 11px; font-weight: 600;
+    color: var(--amber); white-space: nowrap;
+  }
   .contact-table td.na { color: var(--muted); }
   .num-good { color: var(--green); }
   .num-warn { color: var(--amber); }
