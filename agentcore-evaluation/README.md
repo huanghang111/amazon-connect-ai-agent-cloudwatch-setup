@@ -297,7 +297,19 @@ Step Functions 状态机按顺序编排以下 Lambda（`src/` 下同名文件）
 ## 排错：状态机以 `LogEventsNotIndexed` 结束
 
 WaitIndexed 连续 5 次都判定「数据还没被索引」时，状态机会以 `LogEventsNotIndexed` 失败。
-先分清两种情况——**数据真的没到**，还是**判定用的查询看不见已经到了的数据**：
+一条命令把该看的都打出来（只读，不改任何资源）：
+
+```bash
+./diagnose-index-gate.sh                      # 自动取最近一次失败执行
+./diagnose-index-gate.sh --run-id <runId>     # 或指定某次运行
+```
+
+它回答三个问题：部署的 `wait_indexed` 是不是带索引门修复的版本（看有没有 `REQUIRE_SPAN_INDEX`）、
+卡住的是 `aws/spans` 的 span 文档还是运行时日志组的 log event（逐轮打印两半各缺多少）、
+以及数据是「没到」还是「到了但查询看不见」（对同一个 spanId 跑原始文本 / parse / 字段三种查询对比）。
+最后还会打印 Transaction Search 的 destination 与采样率。
+
+下面是它背后的手工做法——**先分清两种情况**：数据真的没到，还是判定用的查询看不见已经到了的数据：
 
 ```bash
 REGION=<region>
