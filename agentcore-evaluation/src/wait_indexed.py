@@ -211,6 +211,12 @@ def handler(event, context):
     print(f"index budget exhausted on attempt {attempt}; "
           f"{len(missing_spans)} span documents and {len(missing_events)} log "
           f"events still missing; rewrote {rewritten} events")
+    # a span the OTLP endpoint never kept can never be indexed, so waiting for it
+    # is hopeless - say so here rather than let five attempts look like slowness
+    if missing_spans and ingest.get("rejectedSpans"):
+        print(f"NOTE: ingest reported {ingest['rejectedSpans']} span(s) rejected by "
+              f"the X-Ray OTLP endpoint {ingest.get('rejectedSpanErrors')} - those "
+              "will never appear in aws/spans, so this gate cannot pass for them")
     return {"runId": run_id, "indexed": False,
             "missing": len(missing_events | missing_spans),
             "missingSpanDocuments": len(missing_spans),

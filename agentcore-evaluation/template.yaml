@@ -93,6 +93,26 @@ Parameters:
     Default: 30
     Description: How long an evaluated sessionId is remembered for deduplication.
 
+  IndexBudgetSeconds:
+    Type: Number
+    Default: 180
+    MinValue: 60
+    MaxValue: 240
+    Description: >
+      How long ONE WaitIndexed attempt polls before it re-writes the still-missing
+      log events and hands back to Step Functions. Capped at 240 so the rewrite
+      still fits inside the function's 300s timeout. Raise it, and IndexMaxAttempts,
+      in a Region where the first run's data takes longer to become queryable.
+
+  IndexMaxAttempts:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 20
+    Description: >
+      How many WaitIndexed attempts before the run fails with LogEventsNotIndexed.
+      Total wait is roughly IndexMaxAttempts * (IndexBudgetSeconds + 120s pause).
+
   RequireSpanIndex:
     Type: String
     Default: 'true'
@@ -451,7 +471,7 @@ Resources:
         Variables:
           RESULTS_BUCKET: !If [CreateBucket, !Ref ResultsBucket, !Ref ResultsBucketName]
           OBSERVABILITY_RUNTIME_NAME: !Ref ObservabilityRuntimeName
-          INDEX_BUDGET_SECONDS: '180'
+          INDEX_BUDGET_SECONDS: !Ref IndexBudgetSeconds
           REQUIRE_SPAN_INDEX: !Ref RequireSpanIndex
 
   EvaluateFunction:
@@ -534,6 +554,7 @@ Resources:
         CollectArn: !GetAtt CollectFunction.Arn
         IngestArn: !GetAtt IngestFunction.Arn
         WaitIndexedArn: !GetAtt WaitIndexedFunction.Arn
+        IndexMaxAttempts: !Ref IndexMaxAttempts
         EvaluateArn: !GetAtt EvaluateFunction.Arn
         RecommendArn: !GetAtt RecommendFunction.Arn
         PublishArn: !GetAtt PublishFunction.Arn
@@ -599,8 +620,9 @@ Resources:
                   "Next": "Analyze"
                 },
                 {
+                  "Comment": "indexAttempt counts exhausted attempts from 0, so >= N means N attempts were spent",
                   "Variable": "$.index.indexAttempt",
-                  "NumericGreaterThan": 4,
+                  "NumericGreaterThanEquals": ${IndexMaxAttempts},
                   "Next": "IndexingTimedOut"
                 }
               ],

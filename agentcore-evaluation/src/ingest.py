@@ -87,7 +87,18 @@ def otlp_value(v):
 
 
 def post_spans(otlp_spans):
-    """SigV4-signed OTLP JSON POST to the X-Ray traces endpoint."""
+    """SigV4-signed OTLP JSON POST to the X-Ray traces endpoint.
+
+    -> (rejected span count, error message). OTLP reports per-request partial
+    failures INSIDE a 200 response (`partialSuccess`), so a call that accepted
+    only 2 of 30 spans still looks like success from the status code alone. That
+    is indistinguishable, from the outside, from "the index is slow": the gate
+    keeps waiting for span documents that were never accepted and will never
+    appear, and the run dies 25 minutes later on a timeout that says nothing
+    about why. So the body is read and the count reported back.
+
+    OTLP only gives a count, not which spans, so the caller can only report it.
+    """
     url = f"https://xray.{REGION}.amazonaws.com/v1/traces"
     creds = boto3.Session().get_credentials().get_frozen_credentials()
     resource = dict(RESOURCE_ATTRS, **{"aws.log.stream.names": SPAN_STREAM})
@@ -103,10 +114,19 @@ def post_spans(otlp_spans):
         with urllib.request.urlopen(
                 urllib.request.Request(url, data=body, headers=dict(req.headers),
                                        method="POST"), timeout=60) as resp:
-            return resp.status
+            raw = resp.read()
     except urllib.error.HTTPError as e:
         raise RuntimeError(f"OTLP traces POST failed {e.code}: "
                            f"{e.read().decode()[:500]}") from e
+    try:
+        ps = (json.loads(raw or b"{}") or {}).get("partialSuccess") or {}
+    except json.JSONDecodeError:
+        return 0, ""
+    rejected = int(ps.get("rejectedSpans") or 0)
+    if rejected:
+        print(f"WARNING: X-Ray OTLP endpoint rejected {rejected} of "
+              f"{len(otlp_spans)} spans: {str(ps.get('errorMessage'))[:500]}")
+    return rejected, str(ps.get("errorMessage") or "")
 
 
 def shift_for(spans, now_ns):
@@ -160,6 +180,7 @@ def handler(event, context):
     now_ns = int(time.time() * 1_000_000_000)
 
     ingested, span_ids, failures, span_epochs = [], [], [], []
+    rejected_spans, rejected_msgs = 0, []
     for entry in manifest["sessions"]:
         sid = entry["sessionId"]
         try:
@@ -172,7 +193,10 @@ def handler(event, context):
             for sp in otlp_spans:
                 span_epochs.append(int(sp["startTimeUnixNano"]) // 1_000_000_000)
             for i in range(0, len(otlp_spans), OTLP_BATCH_SPANS):
-                post_spans(otlp_spans[i:i + OTLP_BATCH_SPANS])
+                n_rejected, msg = post_spans(otlp_spans[i:i + OTLP_BATCH_SPANS])
+                rejected_spans += n_rejected
+                if n_rejected and msg and msg not in rejected_msgs:
+                    rejected_msgs.append(msg[:500])
             if events:
                 # a transcript-carrying session can exceed the 1 MB per-call
                 # limit on its own; logbatch sorts and splits into legal calls
@@ -200,6 +224,10 @@ def handler(event, context):
               "spanTimeRange": {"startEpoch": min(span_epochs) if span_epochs else None,
                                 "endEpoch": max(span_epochs) if span_epochs else None,
                                 "ingestedAtEpoch": now_ns // 1_000_000_000},
+              # spans the OTLP endpoint accepted the request for but did not keep;
+              # non-zero here explains a WaitIndexed timeout that nothing else does
+              "rejectedSpans": rejected_spans,
+              "rejectedSpanErrors": rejected_msgs,
               "failures": failures}
     s3.put_object(Bucket=BUCKET, Key=f"runs/{run_id}/ingest.json",
                   Body=json.dumps(result, ensure_ascii=False, indent=1).encode(),

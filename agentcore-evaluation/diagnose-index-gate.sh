@@ -111,7 +111,11 @@ SID="$(python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print((d.get
 N_SPANS="$(python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('spanIds') or []))" <<<"${ING}")"
 FAILURES="$(python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(json.dumps(d.get('failures') or [], ensure_ascii=False))" <<<"${ING}")"
 START_EPOCH="$(python3 -c "import json,sys; d=json.loads(sys.stdin.read()); r=d.get('spanTimeRange') or {}; print(r.get('startEpoch') or r.get('ingestedAtEpoch') or 0)" <<<"${ING}")"
+REJECTED="$(python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('rejectedSpans','n/a(旧版本 ingest)'), d.get('rejectedSpanErrors') or '')" <<<"${ING}")"
 echo "    注入 span 数: ${N_SPANS}   ingest 失败的会话: ${FAILURES}"
+echo "    OTLP 端点拒收的 span: ${REJECTED}"
+echo "      (>0 就是根因: 这些 span 根本没被 X-Ray 收下，永远不会出现在 aws/spans,"
+echo "       索引门等到超时也不可能通过)"
 echo "    抽样 spanId : ${SID}"
 [[ -z "${SID}" ]] && { echo "    ingest.json 里没有 spanId，说明第 2 步(Ingest)就没写进去"; exit 0; }
 
