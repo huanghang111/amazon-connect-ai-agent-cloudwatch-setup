@@ -211,6 +211,19 @@ def handler(event, context):
     print(f"index budget exhausted on attempt {attempt}; "
           f"{len(missing_spans)} span documents and {len(missing_events)} log "
           f"events still missing; rewrote {rewritten} events")
+    # Which ones, not just how many: with the ids in hand the same three queries
+    # that diagnose-index-gate.sh runs can be pointed at a span that is actually
+    # missing. Sampling an id out of ingest.json hits a span that already landed
+    # and proves nothing. Also print the window queried, because "absent" and
+    # "outside the window" look identical from the counts alone.
+    if missing_spans:
+        print(f"missing spanIds (span documents, up to 10): "
+              f"{sorted(missing_spans)[:10]} queried {SPANS_LOG_GROUP} over "
+              f"[{span_start}, {int(time.time()) + 600}]")
+    if missing_events:
+        print(f"missing spanIds (log events, up to 10): "
+              f"{sorted(missing_events)[:10]} queried {LOG_GROUP} over "
+              f"[{event_start}, {int(time.time()) + 600}]")
     # a span the OTLP endpoint never kept can never be indexed, so waiting for it
     # is hopeless - say so here rather than let five attempts look like slowness
     if missing_spans and ingest.get("rejectedSpans"):

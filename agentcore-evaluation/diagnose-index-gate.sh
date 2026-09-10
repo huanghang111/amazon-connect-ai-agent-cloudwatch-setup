@@ -93,8 +93,9 @@ echo "    wait_indexed 的判定过程(每轮两半各缺多少):"
 aws logs filter-log-events --log-group-name "/aws/lambda/${STACK_NAME}-wait-indexed" \
   --start-time "$(( ($(date +%s) - 3 * 86400) * 1000 ))" --region "${REGION}" \
   --query 'events[].message' --output text 2>/dev/null \
-  | tr '\t' '\n' | grep -E "waiting to index|budget exhausted|all .* spans indexed|query on" | tail -24 \
-  | sed 's/^/      /'
+  | tr '\t' '\n' > /tmp/wait-indexed-lines.txt
+grep -E "waiting to index|budget exhausted|all .* spans indexed|query on|missing spanIds|NOTE:" \
+  /tmp/wait-indexed-lines.txt | tail -28 | sed 's/^/      /'
 echo "      (span documents 一直是满值 = span 那半没通过; log events 一直是满值 = 事件那半没通过;"
 echo "       两半都归零那一行出现过，就说明门开过，失败在别处)"
 
@@ -108,6 +109,17 @@ if [[ -z "${ING}" ]]; then
   echo "    读不到 runs/${RUN_ID}/ingest.json，跳过"; exit 0
 fi
 SID="$(python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print((d.get('spanIds') or [''])[0])" <<<"${ING}")"
+# a span the gate reported as MISSING is the only interesting one: spanIds[0] is
+# usually one that already landed, and then all three queries return 1 and prove
+# nothing. wait_indexed logs the ids since 2026-09-10.
+MISSING_SID="$(grep -oE "missing spanIds \(span documents[^]]*\[[^]]*" /tmp/wait-indexed-lines.txt 2>/dev/null \
+  | tail -1 | grep -oE "[0-9a-f]{16}" | head -1)"
+MISSING_WHAT="span 文档"
+if [[ -z "${MISSING_SID}" ]]; then   # 没有 span 侧缺失就退到事件侧
+  MISSING_SID="$(grep -oE "missing spanIds \(log events[^]]*\[[^]]*" /tmp/wait-indexed-lines.txt 2>/dev/null \
+    | tail -1 | grep -oE "[0-9a-f]{16}" | head -1)"
+  MISSING_WHAT="log event"
+fi
 N_SPANS="$(python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('spanIds') or []))" <<<"${ING}")"
 FAILURES="$(python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(json.dumps(d.get('failures') or [], ensure_ascii=False))" <<<"${ING}")"
 START_EPOCH="$(python3 -c "import json,sys; d=json.loads(sys.stdin.read()); r=d.get('spanTimeRange') or {}; print(r.get('startEpoch') or r.get('ingestedAtEpoch') or 0)" <<<"${ING}")"
@@ -116,50 +128,73 @@ echo "    注入 span 数: ${N_SPANS}   ingest 失败的会话: ${FAILURES}"
 echo "    OTLP 端点拒收的 span: ${REJECTED}"
 echo "      (>0 就是根因: 这些 span 根本没被 X-Ray 收下，永远不会出现在 aws/spans,"
 echo "       索引门等到超时也不可能通过)"
-echo "    抽样 spanId : ${SID}"
+echo "    ingest.json spanTimeRange: $(python3 -c "import json,sys; print(json.dumps((json.loads(sys.stdin.read()).get('spanTimeRange') or {})))" <<<"${ING}")"
 [[ -z "${SID}" ]] && { echo "    ingest.json 里没有 spanId，说明第 2 步(Ingest)就没写进去"; exit 0; }
 
+# 索引门用的窗口(span 文档按 span 自己的 startTimeUnixNano 落库，实测确认)
 QSTART=$(( START_EPOCH - 3600 ))
 QEND=$(( $(date +%s) + 600 ))
+# 宽窗口: 覆盖 aws/spans 的整个保留期。用来区分「文档不存在」和「文档在窗口外」
+WSTART=$(( $(date +%s) - 35 * 86400 ))
+WEND=$(( $(date +%s) + 3600 ))
+echo "    索引门窗口  : [${QSTART}, ${QEND}]"
+echo "    对照宽窗口  : [${WSTART}, ${WEND}] (35 天)"
 
-run_q() {  # $1=log group  $2=query  -> recordsMatched
+run_q() {  # $1=log group  $2=query  $3=start  $4=end  -> recordsMatched
   local qid matched
-  qid="$(aws logs start-query --log-group-name "$1" --start-time "${QSTART}" \
-    --end-time "${QEND}" --query-string "$2" --region "${REGION}" \
+  qid="$(aws logs start-query --log-group-name "$1" --start-time "$3" \
+    --end-time "$4" --query-string "$2" --region "${REGION}" \
     --query queryId --output text 2>/dev/null)" || { echo "查询失败"; return; }
   for _ in $(seq 1 30); do
     matched="$(aws logs get-query-results --query-id "${qid}" --region "${REGION}" \
       --query '[status,statistics.recordsMatched]' --output text 2>/dev/null)"
-    [[ "${matched}" == Running* || "${matched}" == Scheduled* ]] || { echo "${matched}" | awk '{print $2" (status "$1")"}'; return; }
+    [[ "${matched}" == Running* || "${matched}" == Scheduled* ]] || { echo "${matched}" | awk '{print $2}'; return; }
     sleep 2
   done
   echo "超时"
 }
 
-PARSE_Q='parse @message /"spanId":\s*"(?<sid>[0-9a-fA-F]{16})"/ | filter sid = "'"${SID}"'" | limit 5'
-RAW_Q='fields @message | filter @message like /'"${SID}"'/ | limit 5'
-FIELD_Q='fields spanId | filter spanId = "'"${SID}"'" | limit 5'
-
-for LG in "${SPANS_LOG_GROUP}" "${RT_LOG_GROUP}"; do
+probe_sid() {  # $1=spanId  $2=标签
+  local sid="$1" label="$2" lg
+  local parse_q raw_q field_q
+  parse_q='parse @message /"spanId":\s*"(?<sid>[0-9a-fA-F]{16})"/ | filter sid = "'"${sid}"'" | limit 5'
+  raw_q='fields @message | filter @message like /'"${sid}"'/ | limit 5'
+  field_q='fields spanId | filter spanId = "'"${sid}"'" | limit 5'
   echo ""
-  echo "    ${LG}:"
-  echo "      A 原始文本  (@message like)      -> $(run_q "${LG}" "${RAW_Q}")"
-  echo "      B parse 判定(流水线现在用的)     -> $(run_q "${LG}" "${PARSE_Q}")"
-  echo "      C 字段判定  (旧的 ispresent 路径)-> $(run_q "${LG}" "${FIELD_Q}")"
-done
+  echo "    --- ${label}: ${sid}"
+  for lg in "${SPANS_LOG_GROUP}" "${RT_LOG_GROUP}"; do
+    echo "      ${lg}"
+    echo "        A 原始文本 (@message like)        门窗口=$(run_q "${lg}" "${raw_q}" "${QSTART}" "${QEND}")  宽窗口=$(run_q "${lg}" "${raw_q}" "${WSTART}" "${WEND}")"
+    echo "        B parse 判定(流水线在用)          门窗口=$(run_q "${lg}" "${parse_q}" "${QSTART}" "${QEND}")  宽窗口=$(run_q "${lg}" "${parse_q}" "${WSTART}" "${WEND}")"
+    echo "        C 字段判定 (旧 ispresent 路径)    门窗口=$(run_q "${lg}" "${field_q}" "${QSTART}" "${QEND}")"
+  done
+}
+
+if [[ -n "${MISSING_SID}" ]]; then
+  probe_sid "${MISSING_SID}" "索引门报告【缺失】的 span(${MISSING_WHAT}那一半)"
+else
+  echo ""
+  echo "    (日志里没有 'missing spanIds' 行 —— 要么这次两半都通过了，要么 wait_indexed"
+  echo "     还是 2026-09-10 之前的版本。只能退而测 ingest.json 的第一个 span,"
+  echo "     它通常是已经落库的那批，测不到关键对象)"
+fi
+probe_sid "${SID}" "ingest.json 的第一个 span(对照)"
+
+echo ""
+echo "    aws/spans 里一共有多少文档(35 天):"
+echo "      $(run_q "${SPANS_LOG_GROUP}" 'fields @message | filter @message like /spanId/ | limit 1' "${WSTART}" "${WEND}") 条"
 
 cat <<'HINT'
 
-    怎么读:
-      A=0            -> 数据真的没到这个日志组。span 侧查 Transaction Search(下面第 4 步)
-                        与 ingest 步骤的 OTLP 返回；事件侧查 PutLogEvents 是否报错。
-      A>0 且 B=0     -> 数据在，但连 parse 都匹配不到:序列化形状与预期不同,把 A 查到的
-                        原始 @message 发出来，需要按实际形状调整。
-      A>0 B>0 C=0    -> 这就是本次修复覆盖的情况(字段发现不生效)。若仍失败，说明部署的
-                        是旧代码,见第 1 步。
-      A>0 B>0 C>0    -> 数据与查询都正常，纯粹是索引还没赶上:第一次在新建日志流上写入
-                        最慢，重跑一次(run-now.sh --force)通常就过了；也可以调大
-                        wait-indexed 的 INDEX_BUDGET_SECONDS。
+    怎么读(以【缺失】那个 span 为准):
+      两个窗口都 0    -> 文档确实不在 aws/spans。X-Ray 收下了请求(rejectedSpans=0)却没落库,
+                         对照第 4 步的 Transaction Search 状态，并把 ingest.json 与本段一起发出来。
+      门窗口 0/宽窗口>0 -> 文档在，但落在索引门查询的时间窗之外。把上面两个窗口和文档的
+                         @timestamp 对比即可定位(实测: 文档时间戳 = span 的 startTimeUnixNano)。
+      两个窗口都>0     -> 查询能看到，判定却说缺失: 说明是时序——查的那一刻还没可见。
+                         实测同一批 span 的可见时间能错开 6 分钟以上，单轮预算 180s 不够:
+                         调大 INDEX_BUDGET_SECONDS(≤240)与 INDEX_MAX_ATTEMPTS。
+      A>0 而 B=0       -> 序列化形状与 parse 不符，把 A 查到的原始 @message 发出来。
 HINT
 
 # ---------------------------------------------------------------------------
