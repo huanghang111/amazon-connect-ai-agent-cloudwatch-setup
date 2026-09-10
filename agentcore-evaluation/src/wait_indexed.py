@@ -4,10 +4,13 @@ Batch evaluation reads BOTH halves of the ingested data through the Logs Insight
 index, and each half has its own lag. Starting a job before either one is
 queryable fails every session in it, so both are gated here:
 
-Note the two halves are also indexed under DIFFERENT timestamps, so each needs
-its own query window: a log event lands at the time PutLogEvents ran, but a span
-document lands at the span's own startTimeUnixNano, which for a replayed session
-is in the past. ingest.py records that range as `spanTimeRange`.
+Both halves are indexed under the SESSION's own clock, not the ingest time: a
+span document lands at the span's startTimeUnixNano, and a log event lands at
+whatever timestamp PutLogEvents was given, which is that same session time
+(ingest.py only shifts a session when it is close to the 14-day PutLogEvents
+limit). Evaluating yesterday's calls therefore indexes yesterday, and a query
+window that starts "now" finds neither half. ingest.py records the range as
+`spanTimeRange`, and both queries use it.
 
   * span documents in "aws/spans" (written via the X-Ray OTLP endpoint). If these
     are not indexed yet, the job fails with
@@ -115,7 +118,7 @@ def indexed_span_ids(log_group, start_epoch, end_epoch):
     return found
 
 
-def rewrite_events(missing):
+def rewrite_events(missing, start_epoch, end_epoch):
     """Re-emit only the still-unindexed events under current timestamps.
 
     This is the documented workaround for the stuck-first-batch case: identical
@@ -125,16 +128,24 @@ def rewrite_events(missing):
     and a rewrite is itself part of the stream, so re-emitting everything found
     would double the stream on each attempt (and re-send events that are already
     indexed). Deduplicating by spanId keeps a retry the same size as the gap.
+
+    Reads with FilterLogEvents rather than GetLogEvents. GetLogEvents pages are
+    documented to be "partially full, or even empty" without that meaning the end
+    of the stream - a break on the first empty page silently found nothing to
+    rewrite ("rewrote 0 events") on a stream large enough to produce one, which is
+    exactly when the rewrite is needed. FilterLogEvents ends when it stops
+    returning a nextToken, and takes the time window, so a shared stream that has
+    accumulated many runs is not re-read from the beginning every attempt.
     """
-    seen, events, token = set(), [], None
+    seen, events, token, scanned = set(), [], None, 0
     while True:
-        kw = {"logGroupName": LOG_GROUP, "logStreamName": EVENT_STREAM,
-              "startFromHead": True}
+        kw = {"logGroupName": LOG_GROUP, "logStreamNames": [EVENT_STREAM],
+              "startTime": start_epoch * 1000, "endTime": end_epoch * 1000}
         if token:
             kw["nextToken"] = token
-        r = logs.get_log_events(**kw)
-        batch = r["events"]
-        for e in batch:
+        r = logs.filter_log_events(**kw)
+        for e in r.get("events", []):
+            scanned += 1
             msg = e["message"]
             try:
                 span_id = json.loads(msg).get("spanId")
@@ -143,10 +154,13 @@ def rewrite_events(missing):
             if span_id in missing and span_id not in seen:
                 seen.add(span_id)
                 events.append(msg)
-        if not batch or r.get("nextForwardToken") == token:
+        token = r.get("nextToken")
+        if not token:
             break
-        token = r["nextForwardToken"]
     if not events:
+        print(f"nothing to rewrite: scanned {scanned} event(s) in {EVENT_STREAM} "
+              f"over [{start_epoch}, {end_epoch}], none of them among the "
+              f"{len(missing)} missing spanIds")
         return 0
     # event bodies carry whole transcripts, so a gap of any size can exceed the
     # 1 MB PutLogEvents limit; logbatch splits it into legal calls
@@ -181,7 +195,14 @@ def handler(event, context):
     rng = ingest.get("spanTimeRange") or {}
     ingested_at = rng.get("ingestedAtEpoch") or int(time.time())
     span_start = min(rng.get("startEpoch") or ingested_at, ingested_at) - 600
-    event_start = ingested_at - 600
+    # The log events carry the SESSION's timestamps, not the ingest time:
+    # PutLogEvents keeps whatever timestamp it is given, and ingest.py only shifts
+    # a session when it is close to the 14-day limit. A session evaluated two days
+    # after the call therefore indexes two days in the past, so a window that
+    # starts at ingest time cannot see it, and the gate reported every log event
+    # missing on every run - masked until now because rewriting them under current
+    # timestamps DID land inside that window. Same clock as the span side.
+    event_start = span_start
 
     deadline = time.time() + BUDGET_SECONDS
     missing_events = wanted
@@ -207,7 +228,8 @@ def handler(event, context):
 
     # Only the PutLogEvents side can be nudged by rewriting; span documents are
     # owned by X-Ray, so for those the only option is to wait and retry.
-    rewritten = rewrite_events(missing_events) if missing_events else 0
+    rewritten = (rewrite_events(missing_events, event_start, int(time.time()) + 600)
+                 if missing_events else 0)
     print(f"index budget exhausted on attempt {attempt}; "
           f"{len(missing_spans)} span documents and {len(missing_events)} log "
           f"events still missing; rewrote {rewritten} events")
